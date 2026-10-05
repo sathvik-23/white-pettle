@@ -84,7 +84,7 @@ $("#startForm").addEventListener("submit", (e) => {
   const url = $("#startUrl").value.trim();
   if (!url) return $("#startUrl").focus();
   if (APP.cfg.access) { APP.code = $("#accessCode").value.trim() || APP.code; store.set("code", APP.code); if (!APP.code) { $("#startErr").textContent = "Enter the access code first."; return; } }
-  if (!APP.cfg.engines.length) { $("#startErr").textContent = "No AI engine is configured on the server. Add OPENAI_API_KEY to the environment variables."; return; }
+  if (!APP.cfg.engines.length) { $("#startErr").textContent = "No AI engine is configured on the server. Add GEMINI_API_KEY (free) to the environment variables."; return; }
   startMission(url);
 });
 
@@ -690,7 +690,7 @@ async function ask(q) {
   $$(".wordmark .pq").forEach((m) => m.classList.add("anim"));
   try { APP.cfg = await (await fetch("/api/config")).json(); } catch { $("#startErr").textContent = "Can't reach the server."; }
   if (APP.cfg.access) { $("#accessRow").hidden = false; $("#accessCode").value = APP.code || ""; }
-  if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").textContent = "The server has no AI keys yet. Add OPENAI_API_KEY in the environment variables.";
+  if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").textContent = "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
   $("#startUrl").focus();
 })();
 })();

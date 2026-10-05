@@ -14,16 +14,19 @@ Everything appears on a **live map** (you, rivals, questions, cited pages) that 
 
 ## Deploy your own (2 minutes)
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsathvik-23%2Fwhite-pettle&project-name=white-petal&repository-name=white-petal&env=OPENAI_API_KEY,ACCESS_CODE&envDescription=OpenAI%20key%20powers%20the%20agent.%20ACCESS_CODE%20stops%20strangers%20using%20your%20credits.&envLink=https%3A%2F%2Fplatform.openai.com%2Fapi-keys)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsathvik-23%2Fwhite-pettle&project-name=white-petal&repository-name=white-petal&env=GEMINI_API_KEY,ACCESS_CODE&envDescription=Free%20Gemini%20key%20powers%20the%20agent.%20ACCESS_CODE%20stops%20strangers%20using%20your%20credits.&envLink=https%3A%2F%2Faistudio.google.com%2Fapikey)
 
 Or import the repo at [vercel.com/new](https://vercel.com/new) and add these **Environment Variables**:
 
 | Name | Required | What it does |
 |---|---|---|
-| `OPENAI_API_KEY` | yes | ChatGPT answers with live web search, plus all AI writing |
+| `GEMINI_API_KEY` | **free**, recommended | Gemini as a live engine with Google Search grounding, plus all AI writing. Get one at aistudio.google.com/apikey |
+| `GROQ_API_KEY` | free, optional | A fast, free writing model (Llama 3.3 70B) |
 | `ACCESS_CODE` | recommended | Anyone using your link has to type this code before the agent runs |
-| `PERPLEXITY_API_KEY` | optional | Adds Perplexity as a live engine |
-| `GEMINI_API_KEY` | optional | Adds Gemini (with Google Search grounding) as a live engine |
+| `OPENAI_API_KEY` | paid, optional | Adds ChatGPT as a live engine |
+| `PERPLEXITY_API_KEY` | paid, optional | Adds Perplexity as a live engine |
+
+The writing model is picked in this order: Gemini → Groq → OpenAI → Anthropic. Force one with `PETTLE_LLM_PROVIDER`.
 
 There's no build step and no database. Company profiles and runs are saved in each visitor's browser.
 

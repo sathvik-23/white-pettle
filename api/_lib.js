@@ -6,6 +6,38 @@ export const LLM_MODEL = () => env("PETTLE_LLM_MODEL", "gpt-4.1");
 export const FAST_MODEL = () => env("PETTLE_FAST_MODEL", "gpt-4.1-mini");
 export const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 WhitePettle/1.0";
 
+export const GEMINI_MODELS = () => [...new Set([env("PETTLE_GEMINI_MODEL", "gemini-flash-latest"), "gemini-2.5-flash", "gemini-2.0-flash"])];
+// Which model writes (questions, insights, pitches...). Free options first.
+export function llmProvider() {
+  const want = env("PETTLE_LLM_PROVIDER").toLowerCase();
+  const have = { gemini: !!env("GEMINI_API_KEY"), groq: !!env("GROQ_API_KEY"), openai: !!env("OPENAI_API_KEY"), anthropic: !!env("ANTHROPIC_API_KEY") };
+  if (want && have[want]) return want;
+  return ["gemini", "groq", "openai", "anthropic"].find((k) => have[k]) || null;
+}
+
+async function geminiCall(prompt, { stream = false, max = 4000, onDelta } = {}) {
+  let last;
+  for (const model of GEMINI_MODELS()) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
+    const r = await fetch(url, { method: "POST", headers: { "x-goog-api-key": env("GEMINI_API_KEY"), "content-type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: max } }) });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); last = new Error(d?.error?.message || `Gemini error ${r.status}`); if (r.status === 404 || /not found|not supported/i.test(last.message)) continue; throw last; }
+    if (!stream) { const d = await r.json(); return (d.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(""); }
+    let all = "";
+    for await (const { data } of readSSE(r)) { const t = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(""); if (t) { all += t; onDelta?.(t); } }
+    return all;
+  }
+  throw last || new Error("No Gemini model available");
+}
+async function groqCall(prompt, { stream = false, max = 4000, onDelta } = {}) {
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: env("PETTLE_GROQ_MODEL", "llama-3.3-70b-versatile"), messages: [{ role: "user", content: prompt }], max_tokens: Math.min(max, 8000), stream }) });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `Groq error ${r.status}`); }
+  if (!stream) { const d = await r.json(); return d.choices?.[0]?.message?.content || ""; }
+  let all = "";
+  for await (const { data } of readSSE(r)) { const t = data.choices?.[0]?.delta?.content; if (t) { all += t; onDelta?.(t); } }
+  return all;
+}
+
 export function engines() {
   const e = [];
   if (env("OPENAI_API_KEY")) e.push("chatgpt");
@@ -186,17 +218,20 @@ export function snippetAround(text, name, width = 110) {
 
 // ---------- LLM ----------
 export async function llmText(prompt, { model, max = 4000 } = {}) {
-  if (env("OPENAI_API_KEY")) {
+  const pv = llmProvider();
+  if (pv === "gemini") return geminiCall(prompt, { max });
+  if (pv === "groq") return groqCall(prompt, { max });
+  if (pv === "openai") {
     const r = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, max_output_tokens: max }) });
     const d = await r.json(); if (!r.ok) throw new Error(d?.error?.message || `OpenAI error ${r.status}`);
     return openaiText(d);
   }
-  if (env("ANTHROPIC_API_KEY")) {
+  if (pv === "anthropic") {
     const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, messages: [{ role: "user", content: prompt }] }) });
     const d = await r.json(); if (!r.ok) throw new Error(d?.error?.message || `Anthropic error ${r.status}`);
     return (d.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
   }
-  throw new Error("No AI key configured. Add OPENAI_API_KEY in your environment variables.");
+  throw new Error("No AI key configured. Add GEMINI_API_KEY (free) or GROQ_API_KEY (free) in your environment variables.");
 }
 export async function llmJSON(prompt, opts) { return parseLoose(await llmText(prompt + "\n\nReply with only the JSON.", opts)); }
 export function parseLoose(t) {
@@ -214,7 +249,10 @@ export function openaiText(d) {
 
 // Stream plain text from the writing model, calling onDelta for each chunk.
 export async function llmStream(prompt, onDelta, { model, max = 6000 } = {}) {
-  if (env("OPENAI_API_KEY")) {
+  const pv = llmProvider();
+  if (pv === "gemini") return geminiCall(prompt, { stream: true, max, onDelta });
+  if (pv === "groq") return groqCall(prompt, { stream: true, max, onDelta });
+  if (pv === "openai") {
     const r = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, stream: true, max_output_tokens: max }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `OpenAI error ${r.status}`); }
     let all = "";
@@ -225,21 +263,21 @@ export async function llmStream(prompt, onDelta, { model, max = 6000 } = {}) {
     }
     return all;
   }
-  if (env("ANTHROPIC_API_KEY")) {
+  if (pv === "anthropic") {
     const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, stream: true, messages: [{ role: "user", content: prompt }] }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `Anthropic error ${r.status}`); }
     let all = "";
     for await (const { data } of readSSE(r)) if (data.type === "content_block_delta" && data.delta?.text) { all += data.delta.text; onDelta(data.delta.text); }
     return all;
   }
-  throw new Error("No AI key configured. Add OPENAI_API_KEY in your environment variables.");
+  throw new Error("No AI key configured. Add GEMINI_API_KEY (free) or GROQ_API_KEY (free) in your environment variables.");
 }
 
 export async function extractBrands(answer, known) {
   const found = orderKnown(answer, known);
-  if (!env("OPENAI_API_KEY") && !env("ANTHROPIC_API_KEY")) return found;
+  if (!llmProvider()) return found;
   try {
-    const arr = await llmJSON(`List every brand, product, company or service this AI answer recommends or names, in the order they first appear. Exclude publishers and websites that are only cited as sources. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { model: env("OPENAI_API_KEY") ? FAST_MODEL() : undefined, max: 600 });
+    const arr = await llmJSON(`List every brand, product, company or service this AI answer recommends or names, in the order they first appear. Exclude publishers and websites that are only cited as sources. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { model: llmProvider() === "openai" ? FAST_MODEL() : undefined, max: 600 });
     const out = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim()).filter(Boolean);
     for (const k of found) if (!out.some((a) => norm(a) === norm(k))) out.push(k);
     return out.slice(0, 20);

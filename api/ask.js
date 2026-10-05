@@ -1,5 +1,5 @@
 // Ask one live AI engine one buyer question, streaming its search, sources and answer as they happen.
-import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText } from "./_lib.js";
+import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText, GEMINI_MODELS } from "./_lib.js";
 export const config = { runtime: "edge" };
 
 const COUNTRY = { india: "IN", "united states": "US", usa: "US", us: "US", america: "US", uk: "GB", "united kingdom": "GB", britain: "GB", canada: "CA", australia: "AU", singapore: "SG", uae: "AE", dubai: "AE", germany: "DE", france: "FR" };
@@ -17,7 +17,7 @@ async function chatgpt(q, brand, send) {
       if (res.ok) { used = model; break; }
       const err = await res.json().catch(() => ({})); const msg = err?.error?.message || "";
       if (res.status === 401) throw new Error("OpenAI rejected the API key.");
-      if (res.status === 429) throw new Error("OpenAI rate limit or quota reached: " + msg);
+      if (res.status === 429) throw new Error(/quota|billing/i.test(msg) ? "OpenAI credits are used up. Remove OPENAI_API_KEY or add credits." : "OpenAI rate limit reached: " + msg);
       if (!/model|tool|web_search/i.test(msg)) throw new Error(msg || `OpenAI error ${res.status}`);
       if (/model/i.test(msg)) break;
     }
@@ -64,10 +64,16 @@ async function perplexity(q, brand, send) {
 }
 
 async function gemini(q, brand, send) {
-  const model = env("PETTLE_GEMINI_MODEL", "gemini-2.5-flash");
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, { method: "POST", headers: { "x-goog-api-key": env("GEMINI_API_KEY"), "content-type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: q }] }], tools: [{ google_search: {} }] }) });
-  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e?.error?.message || `Gemini error ${res.status}`); }
+  let res, model, lastErr;
+  for (const m of GEMINI_MODELS()) {
+    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:streamGenerateContent?alt=sse`, { method: "POST", headers: { "x-goog-api-key": env("GEMINI_API_KEY"), "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: q }] }], tools: [{ google_search: {} }] }) });
+    if (res.ok) { model = m; break; }
+    const e = await res.json().catch(() => ({})); lastErr = e?.error?.message || `Gemini error ${res.status}`;
+    if (res.status === 429) throw new Error("Gemini free-tier limit reached for now: " + lastErr);
+    if (!(res.status === 404 || /not found|not supported/i.test(lastErr))) throw new Error(lastErr);
+  }
+  if (!model) throw new Error(lastErr || "No Gemini model available");
   send("status", { text: "Gemini is searching Google" });
   let text = ""; const seen = new Set(); const sources = [];
   for await (const { data } of readSSE(res)) {
