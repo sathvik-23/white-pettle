@@ -1,0 +1,9 @@
+{
+  "name": "white-pettle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "White Pettle: an AI agent that gets your brand recommended by ChatGPT, Perplexity and Gemini.",
+  "type": "module",
+  "scripts": { "dev": "node dev.mjs" },
+  "engines": { "node": ">=18" }
+}
