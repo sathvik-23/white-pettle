@@ -38,14 +38,40 @@ async function geminiCall(prompt, { stream = false, max = 4000, onDelta } = {}) 
   }
   throw last || new Error("No Gemini model available");
 }
+// Groq's model list changes often, so pick from what this key can actually use.
+let GROQ_IDS = null;
+export async function groqModels() {
+  if (GROQ_IDS) return GROQ_IDS;
+  try { const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { authorization: `Bearer ${env("GROQ_API_KEY")}` } }); const d = await r.json(); GROQ_IDS = (d.data || []).filter((m) => m.active !== false).map((m) => m.id); }
+  catch { GROQ_IDS = []; }
+  return GROQ_IDS;
+}
+export async function pickGroq(prefs, filter, skip = []) {
+  const ids = await groqModels();
+  const p = prefs.filter(Boolean).filter((x) => !skip.includes(x));
+  for (const m of p) if (ids.includes(m)) return m;
+  return ids.filter((x) => !skip.includes(x)).find(filter) || p[0];
+}
+const GROQ_WRITERS = () => [env("PETTLE_GROQ_MODEL"), "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "moonshotai/kimi-k2-instruct-0905", "moonshotai/kimi-k2-instruct", "meta-llama/llama-4-maverick-17b-128e-instruct", "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b", "llama-3.1-8b-instant"];
+const isChatModel = (id) => !/whisper|guard|compound|tts|playai|orpheus|distil|vision|qwen/i.test(id);
 async function groqCall(prompt, { stream = false, max = 4000, onDelta } = {}) {
-  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
-    body: JSON.stringify({ model: env("PETTLE_GROQ_MODEL", "llama-3.3-70b-versatile"), messages: [{ role: "user", content: prompt }], max_tokens: Math.min(max, 8000), stream }) });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `Groq error ${r.status}`); }
-  if (!stream) { const d = await r.json(); return d.choices?.[0]?.message?.content || ""; }
-  let all = "";
-  for await (const { data } of readSSE(r)) { const t = data.choices?.[0]?.delta?.content; if (t) { all += t; onDelta?.(t); } }
-  return all;
+  const tried = [];
+  for (let i = 0; i < 3; i++) {
+    const model = await pickGroq(GROQ_WRITERS(), isChatModel, tried);
+    if (!model) break;
+    const r = await fetchRetry("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: Math.min(max + 2000, 8000), stream }) });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({})); const msg = d?.error?.message || `Groq error ${r.status}`;
+      if (/does not exist|decommissioned|not have access|not found/i.test(msg)) { tried.push(model); continue; }
+      throw new Error(msg);
+    }
+    if (!stream) { const d = await r.json(); return (d.choices?.[0]?.message?.content || "").replace(/<think>[\s\S]*?<\/think>/g, ""); }
+    let all = "";
+    for await (const { data } of readSSE(r)) { const t = data.choices?.[0]?.delta?.content; if (t) { all += t; onDelta?.(t); } }
+    return all;
+  }
+  throw new Error("No Groq chat model is available for this key.");
 }
 
 export function engines() {
@@ -62,6 +88,22 @@ export function guard(req) {
   if (!code) return null;
   if (req.headers.get("x-access-code") === code) return null;
   return json({ error: "Access code required", code: "access" }, 401);
+}
+
+
+// Upstream AI calls: retry rate limits and transient errors with backoff, so several people can use the app at once.
+export async function fetchRetry(url, opts = {}, tries = 4) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    let r;
+    try { r = await fetch(url, opts); } catch (e) { last = e; await new Promise((ok) => setTimeout(ok, 800 * 2 ** i)); continue; }
+    if (![429, 500, 502, 503, 504, 529].includes(r.status) || i === tries - 1) return r;
+    const peek = await r.clone().text().catch(() => "");
+    if (/insufficient_quota|billing|credits are depleted|prepay/i.test(peek)) return r; // out of money: retrying won't help
+    const ra = Number(r.headers.get("retry-after")) || 0;
+    await new Promise((ok) => setTimeout(ok, Math.min(20000, ra ? ra * 1000 : 1200 * 2 ** i + Math.random() * 800)));
+  }
+  throw last || new Error("Upstream AI service unavailable");
 }
 
 export const json = (obj, status = 200) =>
@@ -233,12 +275,12 @@ async function llmTextWith(pv, prompt, { model, max = 4000 } = {}) {
   if (pv === "gemini") return geminiCall(prompt, { max });
   if (pv === "groq") return groqCall(prompt, { max });
   if (pv === "openai") {
-    const r = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, max_output_tokens: max }) });
+    const r = await fetchRetry("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, max_output_tokens: max }) });
     const d = await r.json(); if (!r.ok) throw new Error(d?.error?.message || `OpenAI error ${r.status}`);
     return openaiText(d);
   }
   if (pv === "anthropic") {
-    const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, messages: [{ role: "user", content: prompt }] }) });
+    const r = await fetchRetry("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, messages: [{ role: "user", content: prompt }] }) });
     const d = await r.json(); if (!r.ok) throw new Error(d?.error?.message || `Anthropic error ${r.status}`);
     return (d.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
   }
@@ -267,7 +309,7 @@ async function llmStreamWith(pv, prompt, onDelta, { model, max = 6000 } = {}) {
   if (pv === "gemini") return geminiCall(prompt, { stream: true, max, onDelta });
   if (pv === "groq") return groqCall(prompt, { stream: true, max, onDelta });
   if (pv === "openai") {
-    const r = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, stream: true, max_output_tokens: max }) });
+    const r = await fetchRetry("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" }, body: JSON.stringify({ model: model || LLM_MODEL(), input: prompt, stream: true, max_output_tokens: max }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `OpenAI error ${r.status}`); }
     let all = "";
     for await (const { event, data } of readSSE(r)) {
@@ -278,7 +320,7 @@ async function llmStreamWith(pv, prompt, onDelta, { model, max = 6000 } = {}) {
     return all;
   }
   if (pv === "anthropic") {
-    const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, stream: true, messages: [{ role: "user", content: prompt }] }) });
+    const r = await fetchRetry("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01", "content-type": "application/json" }, body: JSON.stringify({ model: env("PETTLE_ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens: max, stream: true, messages: [{ role: "user", content: prompt }] }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d?.error?.message || `Anthropic error ${r.status}`); }
     let all = "";
     for await (const { data } of readSSE(r)) if (data.type === "content_block_delta" && data.delta?.text) { all += data.delta.text; onDelta(data.delta.text); }

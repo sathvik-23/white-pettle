@@ -1,5 +1,5 @@
 // Ask one live AI engine one buyer question, streaming its search, sources and answer as they happen.
-import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText, GEMINI_MODELS } from "./_lib.js";
+import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText, GEMINI_MODELS, pickGroq, fetchRetry } from "./_lib.js";
 export const config = { runtime: "edge" };
 
 const COUNTRY = { india: "IN", "united states": "US", usa: "US", us: "US", america: "US", uk: "GB", "united kingdom": "GB", britain: "GB", canada: "CA", australia: "AU", singapore: "SG", uae: "AE", dubai: "AE", germany: "DE", france: "FR" };
@@ -12,7 +12,7 @@ async function chatgpt(q, brand, send) {
   for (const model of models) {
     for (const type of ["web_search", "web_search_preview"]) {
       const tool = { type }; if (country) tool.user_location = { type: "approximate", country };
-      res = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" },
+      res = await fetchRetry("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${env("OPENAI_API_KEY")}`, "content-type": "application/json" },
         body: JSON.stringify({ model, input: q, tools: [tool], include: ["web_search_call.action.sources"], stream: true }) });
       if (res.ok) { used = model; break; }
       const err = await res.json().catch(() => ({})); const msg = err?.error?.message || "";
@@ -50,7 +50,7 @@ async function chatgpt(q, brand, send) {
 }
 
 async function perplexity(q, brand, send) {
-  const res = await fetch("https://api.perplexity.ai/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("PERPLEXITY_API_KEY")}`, "content-type": "application/json" },
+  const res = await fetchRetry("https://api.perplexity.ai/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("PERPLEXITY_API_KEY")}`, "content-type": "application/json" },
     body: JSON.stringify({ model: env("PETTLE_PPLX_MODEL", "sonar"), messages: [{ role: "user", content: q }], stream: true }) });
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e?.error?.message || `Perplexity error ${res.status}`); }
   send("status", { text: "Perplexity is searching and reading" });
@@ -66,7 +66,7 @@ async function perplexity(q, brand, send) {
 async function gemini(q, brand, send) {
   let res, model, lastErr;
   for (const m of GEMINI_MODELS()) {
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:streamGenerateContent?alt=sse`, { method: "POST", headers: { "x-goog-api-key": env("GEMINI_API_KEY"), "content-type": "application/json" },
+    res = await fetchRetry(`https://generativelanguage.googleapis.com/v1beta/models/${m}:streamGenerateContent?alt=sse`, { method: "POST", headers: { "x-goog-api-key": env("GEMINI_API_KEY"), "content-type": "application/json" },
       body: JSON.stringify({ contents: [{ parts: [{ text: q }] }], tools: [{ google_search: {} }] }) });
     if (res.ok) { model = m; break; }
     const e = await res.json().catch(() => ({})); lastErr = e?.error?.message || `Gemini error ${res.status}`;
@@ -88,10 +88,17 @@ async function gemini(q, brand, send) {
 
 // Groq Compound: an open model with built-in live web search (free tier, no card).
 async function groq(q, brand, send) {
-  const model = env("PETTLE_GROQ_ENGINE", "groq/compound-mini");
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
-    body: JSON.stringify({ model, messages: [{ role: "user", content: q }], stream: true }) });
-  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e?.error?.message || `Groq error ${res.status}`); }
+  const tried = []; let res, model;
+  for (let i = 0; i < 3; i++) {
+    model = await pickGroq([env("PETTLE_GROQ_ENGINE"), "groq/compound-mini", "groq/compound", "compound-beta-mini", "compound-beta"], (id) => /compound/i.test(id), tried);
+    res = await fetchRetry("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: q }], stream: true }) });
+    if (res.ok) break;
+    const e = await res.json().catch(() => ({})); const msg = e?.error?.message || `Groq error ${res.status}`;
+    if (/does not exist|decommissioned|not have access|not found/i.test(msg)) { tried.push(model); res = null; continue; }
+    throw new Error(msg);
+  }
+  if (!res) throw new Error("Groq's web-search model (Compound) isn't available for this key.");
   send("status", { text: "Groq Compound is searching the web" });
   let text = ""; const tools = []; const seen = new Set(); const sources = [];
   const harvest = (obj) => {

@@ -15,25 +15,36 @@ const ENG = { chatgpt: "ChatGPT", perplexity: "Perplexity", gemini: "Gemini", gr
 const ENGC = { chatgpt: "var(--e-chatgpt)", perplexity: "var(--e-perplexity)", gemini: "var(--e-gemini)", groq: "var(--e-groq)" };
 const store = {
   get(k, d) { try { const v = localStorage.getItem("wpetal:" + k); return v ? JSON.parse(v) : d; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch {} },
+  set(k, v) { try { localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch { try { for (let i = localStorage.length - 1; i >= 0; i--) { const kk = localStorage.key(i); if (kk && kk.startsWith("wpetal:prev:")) localStorage.removeItem(kk); } localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch {} } },
 };
 
 /* =================================================================== API */
 const APP = { cfg: { engines: [], llm: false, access: false }, code: store.get("code", ""), M: null, ctl: null, running: false };
 async function post(path, payload, signal) {
-  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal });
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) throw new Error("The access code is missing or wrong.");
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
   return d;
 }
-async function stream(path, payload, on, signal) {
-  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal });
+async function stream(path, payload, on, signal, idleMs = 75000) {
+  const ctl = new AbortController(); let idle = false, timer;
+  const kick = () => { clearTimeout(timer); timer = setTimeout(() => { idle = true; ctl.abort(); }, idleMs); };
+  const onOuter = () => ctl.abort(); signal?.addEventListener("abort", onOuter);
+  if (signal?.aborted) ctl.abort();
+  kick();
+  try { return await streamInner(path, payload, on, ctl.signal, kick); }
+  catch (e) { if (idle && !signal?.aborted) throw new Error("The AI went quiet for too long (timed out)."); throw e; }
+  finally { clearTimeout(timer); signal?.removeEventListener("abort", onOuter); }
+}
+async function streamInner(path, payload, on, signal, kick) {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) throw new Error("The access code is missing or wrong.");
   if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
   const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", err = null;
   for (;;) {
     const { value, done } = await reader.read(); if (done) break;
+    kick();
     buf += dec.decode(value, { stream: true });
     let i;
     while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -69,16 +80,34 @@ function stars() {
   };
   tick();
 }
+function unfinished() {
+  const out = [];
+  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (!k.startsWith("wpetal:mission:")) continue; const m = JSON.parse(localStorage.getItem(k)); if (m && !m.finishedAt && m.profile && m.done) out.push(m); } } catch {}
+  return out.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+}
 function renderRecent() {
   const cos = store.get("companies", {});
   const list = Object.values(cos).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)).slice(0, 6);
-  $("#recent").innerHTML = list.length ? `<span>Saved companies:</span>` + list.map((c) => `<button type="button" data-slug="${esc(c.slug)}">${esc(c.profile.name)}</button>`).join("") : "";
+  const open = unfinished()[0];
+  const res = open ? `<div class="resume" style="width:100%;display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap;margin-bottom:6px"><span style="color:var(--ink)">Your check of <b>${esc(open.profile.name)}</b> was interrupted.</span><button type="button" data-resume="${esc(open.slug)}" style="border-color:var(--petal);color:var(--ink)">Resume where it stopped</button><button type="button" data-discard="${esc(open.slug)}">Discard</button></div>` : "";
+  $("#recent").innerHTML = res + (list.length ? `<span>Saved companies:</span>` + list.map((c) => `<button type="button" data-slug="${esc(c.slug)}">${esc(c.profile.name)}</button>`).join("") : "");
 }
-$("#recent").addEventListener("click", (e) => {
-  const s = e.target.dataset.slug; if (!s) return;
-  const m = store.get("mission:" + s, null);
-  if (m && m.finishedAt) { APP.M = m; showReport(); } else { const c = store.get("companies", {})[s]; if (c) startMission(c.profile.site, c); }
-});
+$("#startErr").addEventListener("click", (e) => { if (e.target.dataset.takeover) { localStorage.removeItem("wpetal:lock:" + (e.target.dataset.resume || e.target.dataset.slug)); $("#recent").dispatchEvent(new CustomEvent("takeover", { detail: e.target.dataset })); } });
+$("#recent").addEventListener("takeover", (e) => { const d = e.detail; const fake = { target: { dataset: { ...d } } }; recentClick(fake); });
+$("#recent").addEventListener("click", (e) => recentClick(e));
+async function recentClick(e) {
+  const s = e.target.dataset.slug, r = e.target.dataset.resume, x = e.target.dataset.discard;
+  if (x) { const m = store.get("mission:" + x, null); if (m) { m.finishedAt = m.finishedAt || Date.now(); m.abandoned = true; store.set("mission:" + x, m); } return renderRecent(); }
+  const slug = s || r; if (!slug) return;
+  if (!e.target.dataset.takeover && (await lockedElsewhere(slug))) {
+    $("#startErr").innerHTML = `This brand looks busy in another tab. <button type="button" class="linkbtn" style="color:var(--petal);text-decoration:underline" data-takeover="1" data-${r ? "resume" : "slug"}="${esc(slug)}">Continue here instead</button>`;
+    return;
+  }
+  $("#startErr").textContent = "";
+  const m = store.get("mission:" + slug, null);
+  if (r && m) return resumeMission(m);
+  if (m && m.finishedAt && !m.abandoned) { APP.M = m; showReport(); } else { const c = store.get("companies", {})[slug]; if (c) startMission(c.profile.site, c); }
+}
 $("#startForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const url = $("#startUrl").value.trim();
@@ -97,7 +126,13 @@ function setupHud() {
   $("#counters").innerHTML = CTRS.map(([k, l]) => `<div class="ctr" data-c="${k}"><b class="tnum">0</b><span>${l}</span></div>`).join("");
   CTRS.forEach(([k]) => (C[k] = 0));
 }
-function bump(k, n = 1) { C[k] = (C[k] || 0) + n; const el = $(`[data-c="${k}"]`); if (!el) return; el.querySelector("b").textContent = C[k]; el.classList.remove("bump"); void el.offsetWidth; el.classList.add("bump"); }
+const bumpAt = {};
+function bump(k, n = 1) {
+  C[k] = (C[k] || 0) + n; const el = $(`[data-c="${k}"]`); if (!el) return;
+  el.querySelector("b").textContent = C[k];
+  const now = Date.now(); if (now - (bumpAt[k] || 0) < 600) return; bumpAt[k] = now;
+  el.classList.remove("bump"); requestAnimationFrame(() => el.classList.add("bump"));
+}
 function phase(k, pct, label) {
   $$("#track > div").forEach((d) => d.classList.toggle("on", d.dataset.ph === k));
   const el = $(`[data-ph="${k}"] i`); if (el) el.style.setProperty("--p", Math.round(pct) + "%");
@@ -166,7 +201,7 @@ function gInit() {
   G.gl = root.append("g"); G.gn = root.append("g");
   svg.call(d3.zoom().scaleExtent([0.3, 4]).on("zoom", (e) => root.attr("transform", e.transform)));
   const box = () => $("#map").getBoundingClientRect();
-  G.sim = d3.forceSimulation()
+  G.sim = d3.forceSimulation().alphaDecay(0.045).velocityDecay(0.5)
     .force("charge", d3.forceManyBody().strength((d) => (d.type === "you" ? -1200 : d.type === "rival" ? -420 : d.type === "source" ? -160 : -90)).distanceMax(600))
     .force("link", d3.forceLink().id((d) => d.id).distance((l) => l.dist || 70).strength((l) => l.str ?? 0.35))
     .force("x", d3.forceX(() => box().width / 2).strength(0.025))
@@ -178,8 +213,10 @@ function gInit() {
     });
   new ResizeObserver(() => G.sim.alpha(0.3).restart()).observe($("#map"));
 }
+const MAP_CAP = { source: 36, rival: 22, question: 40 };
 function gNode(id, type, label, data = {}) {
   let n = G.nodes.get(id);
+  if (!n && MAP_CAP[type] && [...G.nodes.values()].filter((x) => x.type === type).length >= MAP_CAP[type]) return { weight: 0 }; // too many to draw; the counters and tables still have everything
   const b = $("#map").getBoundingClientRect();
   if (!n) { n = { id, type, label, x: b.width / 2 + (Math.random() - .5) * 120, y: b.height / 2 + (Math.random() - .5) * 120, weight: 0, ...data }; if (type === "you") { n.fx = null; } G.nodes.set(id, n); }
   else Object.assign(n, data, { label: label || n.label });
@@ -191,7 +228,7 @@ function gLink(a, b, kind, color) {
   if (!G.links.has(id)) G.links.set(id, { id, source: a, target: b, kind, color, dist: kind === "cited" ? 90 : kind === "on" ? 110 : 150, str: kind === "named" ? 0.12 : 0.25 });
   gSchedule();
 }
-function gSchedule() { if (G.pending) return; G.pending = true; setTimeout(() => { G.pending = false; gRender(); }, 160); }
+function gSchedule() { if (G.pending) return; G.pending = true; setTimeout(() => { G.pending = false; if (!document.hidden) gRender(); else gSchedule(); }, 700); }
 function nodeColor(d) {
   if (d.type === "you") return "#FF7A1A";
   if (d.type === "rival") return "#E2483D";
@@ -214,7 +251,7 @@ function gRender() {
   g.select("circle").attr("r", (d) => d.r).attr("fill", nodeColor).attr("stroke", nodeStroke).attr("stroke-width", (d) => (d.type === "source" && d.inspected ? 2.5 : 1.5))
     .attr("fill-opacity", (d) => (d.type === "source" && d.inspected && !d.you && !d.rivals ? 0.45 : 1));
   g.select("text").text((d) => (d.type === "question" ? "" : (d.label || "").slice(0, d.type === "source" ? 22 : 26)));
-  G.sim.nodes(nodes); G.sim.force("link").links(links); G.sim.alpha(0.45).restart();
+  G.sim.nodes(nodes); G.sim.force("link").links(links); G.sim.alpha(Math.min(0.45, G.sim.alpha() + 0.25)).restart();
 }
 function gFlash(id) { setTimeout(() => { const el = G.gn && G.gn.selectAll("g.node").filter((d) => d.id === id).node(); if (el) { el.classList.remove("flash"); void el.getBBox(); el.classList.add("flash"); } }, 200); }
 const tipEl = $("#tip");
@@ -245,9 +282,11 @@ function openDrawer(d) {
     if (qs.length) h += `<b style="font-size:.85rem">Named for</b><div class="chips">${[...new Set(qs.map((a) => qText(M, a.qid)))].map((q) => `<span class="chip">${esc(q)}</span>`).join("")}</div>`;
     if (pages.length) h += `<b style="font-size:.85rem">Pages that carry ${d.type === "you" ? "you" : "it"}</b>` + pages.map((p) => `<div class="irow"><span class="chip ${d.type === "you" ? "you" : "rv"}">${esc(p.domain)}</span><div><a href="${esc(safeUrl(p.final) || "#")}" target="_blank" rel="noopener">${esc(p.title || p.final)}</a>${(p.evidence || []).filter((e) => norm(e.name) === norm(name)).map((e) => `<div class="ev2">“${highlight(e.snippet, M)}”</div>`).join("")}</div></div>`).join("");
   } else if (d.type === "source") {
-    const url = d.url; const p = (M.inspections || {})[url];
-    const by = ans.filter((a) => (a.sources || []).some((s) => s.url === url));
-    h += `<span class="status">Page AI cited ${d.weight}×</span><h3>${esc(p?.title || d.label)}</h3><a href="${esc(safeUrl(url) || "#")}" target="_blank" rel="noopener" style="font-size:.8rem;overflow-wrap:anywhere">${esc(url)}</a>`;
+    const dom = d.id.slice(2); const url = d.url;
+    const pages = Object.values(M.inspections || {}).filter((x) => host(x.url) === dom);
+    const p = pages.find((x) => x.ok) || pages[0];
+    const by = ans.filter((a) => (a.sources || []).some((s) => host(s.url) === dom));
+    h += `<span class="status">${esc(dom)} · cited ${d.weight}× across answers${pages.length > 1 ? ` · ${pages.length} pages opened` : ""}</span><h3>${esc(p?.title || d.label)}</h3><a href="${esc(safeUrl(url) || "#")}" target="_blank" rel="noopener" style="font-size:.8rem;overflow-wrap:anywhere">${esc(url)}</a>`;
     if (p && p.ok) h += `<div class="chips">${p.you ? '<span class="chip ok">You are on this page</span>' : '<span class="chip no">You are not on this page</span>'}${(p.rivals || []).map((r) => `<span class="chip rv">${esc(r)}</span>`).join("")}</div>${(p.evidence || []).map((e) => `<div class="ev2" style="font-size:.8rem;color:var(--muted)">“${highlight(e.snippet, M)}”</div>`).join("")}${contactHtml(p.contacts)}`;
     else if (p) h += `<p class="muted">Couldn't open it: ${esc(p.reason || "")}</p>`;
     h += `<b style="font-size:.85rem">Cited for</b><div class="chips">${[...new Set(by.map((a) => qText(M, a.qid)))].map((q) => `<span class="chip">${esc(q)}</span>`).join("")}</div>`;
@@ -255,7 +294,7 @@ function openDrawer(d) {
   dr.innerHTML = h; $(".mapwrap").append(dr);
   dr.querySelector(".x").onclick = () => dr.remove();
 }
-const sidOf = (u) => { try { const x = new URL(u); return "s:" + x.hostname.replace(/^www\./, "") + x.pathname.replace(/\/$/, ""); } catch { return "s:" + u; } };
+const sidOf = (u) => "s:" + host(u);
 const qText = (M, qid) => (M.questions.find((q) => q.id === qid) || {}).text || "";
 function srcChips(src) { return `<div class="srcs">${(src || []).slice(0, 12).map((s) => `<a class="src${s.cited ? "" : " weak"}" href="${esc(safeUrl(s.url) || "#")}" target="_blank" rel="noopener" title="${esc(s.title || s.url)}">${esc(host(s.url))}</a>`).join("")}</div>`; }
 function contactHtml(c) { if (!c) return ""; const bits = []; if (c.author) bits.push(`Author: <b>${esc(c.author)}</b>`); (c.emails || []).forEach((m) => bits.push(`<span class="mono">${esc(m)}</span>`)); (c.links || []).slice(0, 2).forEach((l) => bits.push(`<a href="${esc(l)}" target="_blank" rel="noopener">${esc(host(l))}${esc((() => { try { return new URL(l).pathname.slice(0, 24); } catch { return ""; } })())}</a>`)); return bits.length ? `<div class="chips" style="font-size:.78rem">${bits.map((b) => `<span class="chip">${b}</span>`).join("")}</div>` : ""; }
@@ -263,7 +302,9 @@ function verdictHtml(a) { return a.status === "run" ? '<span class="verdict wait
 function countNamed(M) { return Object.values(M.answers).filter((a) => a.named).length; }
 
 /* =================================================================== MATRIX */
-function renderMatrix(el, M, big) {
+const MX = new Map();
+function renderMatrix(el, M, big) { if (MX.has(el)) return; MX.set(el, 1); later(() => { MX.delete(el); renderMatrixNow(el, M, big); }); }
+function renderMatrixNow(el, M, big) {
   const engs = M.engines;
   el.style.gridTemplateColumns = `minmax(0,1fr) repeat(${engs.length}, ${big ? "92px" : "56px"})`;
   let h = `<div></div>` + engs.map((e) => `<div class="eh">${ENG[e]}</div>`).join("");
@@ -283,16 +324,50 @@ addEventListener("keydown", (e) => { if (e.key === "Escape") { $$(".modal,.drawe
 
 /* =================================================================== MISSION */
 function newMission(profile, audit, siteText) {
-  return { id: Date.now().toString(36), slug: slugify(profile.name), startedAt: Date.now(), finishedAt: null, profile, audit, siteText, engines: APP.cfg.engines.slice(), questions: [], answers: {}, inspections: {}, perception: null, insights: "", assets: null, pitches: {}, fixpack: "", articles: {}, deck: {}, chat: [] };
+  return { id: Date.now().toString(36), slug: slugify(profile.name), startedAt: Date.now(), finishedAt: null, profile, audit, siteText, engines: APP.cfg.engines.slice(), questions: [], answers: {}, inspections: {}, perception: null, insights: "", assets: null, pitches: {}, fixpack: "", articles: {}, deck: {}, chat: [], done: {} };
 }
-function save() { if (APP.M) store.set("mission:" + APP.M.slug, APP.M); }
+let saveT = 0;
+function save(now) {
+  if (!APP.M) return;
+  const run = () => { saveT = 0; APP.M.savedAt = Date.now(); store.set("mission:" + APP.M.slug, slim(APP.M)); if (APP.running) lockTouch(APP.M.slug); };
+  if (now) { clearTimeout(saveT); return run(); }
+  if (!saveT) saveT = setTimeout(run, 1500);
+}
+// Keep what the results need, drop bulk that only bloats storage.
+function slim(M) {
+  const answers = {};
+  for (const [k, a] of Object.entries(M.answers || {})) answers[k] = { ...a, answer: String(a.answer || "").slice(0, 4000), sources: (a.sources || []).slice(0, 15), searches: (a.searches || []).slice(0, 6) };
+  const inspections = {};
+  for (const [k, p] of Object.entries(M.inspections || {})) inspections[k] = { ...p, excerpt: String(p.excerpt || "").slice(0, 600) };
+  return { ...M, answers, inspections, siteText: String(M.siteText || "").slice(0, 6000) };
+}
+const later = (f) => (document.hidden ? setTimeout(f, 250) : requestAnimationFrame(f));
+const retryable = (e) => /429|rate|limit|quota exceeded|overload|timed out|timeout|temporar|unavailable|502|503|504|network|fetch|stream/i.test(String(e?.message || e));
+function rivalCounts(M) { const rc = {}; Object.values(M.answers || {}).forEach((a) => (a.brands || []).forEach((b) => { if (!isYou(b, M)) rc[b] = (rc[b] || 0) + 1; })); return rc; }
+// One tab runs a brand at a time; other tabs see it's busy instead of overwriting each other.
+const TAB = Math.random().toString(36).slice(2);
+function lockTouch(slug) { store.set("lock:" + slug, { tab: TAB, ts: Date.now() }); }
+function lockRelease(slug) { const l = store.get("lock:" + slug, null); if (l && l.tab === TAB) { try { localStorage.removeItem("wpetal:lock:" + slug); } catch {} } }
+// Ask other open tabs directly whether they are running this brand (no stale locks after a tab closes or navigates).
+const BC = "BroadcastChannel" in window ? new BroadcastChannel("wpetal") : null;
+if (BC) BC.onmessage = (ev) => { const d = ev.data || {}; if (d.type === "ping" && APP.running && APP.M && APP.M.slug === d.slug) BC.postMessage({ type: "pong", slug: d.slug }); };
+function lockedElsewhere(slug) {
+  if (!BC) { const l = store.get("lock:" + slug, null); return Promise.resolve(!!(l && l.tab !== TAB && Date.now() - l.ts < 25000)); }
+  return new Promise((done) => { let got = false; const h = (ev) => { if (ev.data?.type === "pong" && ev.data.slug === slug) got = true; }; BC.addEventListener("message", h); BC.postMessage({ type: "ping", slug }); setTimeout(() => { BC.removeEventListener("message", h); done(got); }, 350); });
+}
+setInterval(() => { if (APP.running && APP.M) lockTouch(APP.M.slug); }, 8000);
 
-async function startMission(url, saved) {
+function missionUI(title) {
   $("#landing").hidden = true; $("#reportWrap").hidden = true; $("#mission").hidden = false;
   $("#feed").innerHTML = ""; setupHud(); gInit(); setRing(null); $("#toReport").hidden = true; $("#stopBtn").hidden = false;
   $("#liveTag").className = "live"; $("#liveTag").innerHTML = "<i></i>Live"; $("#matrix").innerHTML = "";
-  APP.ctl = new AbortController(); APP.running = true; const sig = APP.ctl.signal;
-  $("#hudBrand").textContent = host(url);
+  APP.ctl?.abort(); APP.ctl = new AbortController(); APP.running = true; APP.resuming = false; stick = true;
+  $("#hudBrand").textContent = title;
+  return APP.ctl.signal;
+}
+
+async function startMission(url, saved) {
+  const sig = missionUI(host(url));
   try {
     // ---------- 1. read the site
     phase("site", 5, "Reading your website");
@@ -321,8 +396,47 @@ async function startMission(url, saved) {
     $("#hudBrand").textContent = profile.name;
     gNode("you", "you", profile.name);
     add(`<span class="ic">✓</span><div><span class="tx">Saved <b>${esc(profile.name)}</b> to your companies. Continuing.</span></div>`, "step ok");
+    await runPipeline(M, sig);
+  } catch (err) { missionError(err, sig); }
+}
 
+async function resumeMission(M) {
+  const sig = missionUI(M.profile.name);
+  APP.M = M; M.done = M.done || {};
+  rebuildMap(M); renderMatrix($("#matrix"), M); setRing(liveScore(M));
+  const ans = Object.values(M.answers || {});
+  bump("q", M.questions.length); bump("a", ans.filter((a) => a.status === "yes" || a.status === "no").length); bump("src", ans.reduce((s, a) => s + (a.sources || []).length, 0)); bump("p", Object.keys(M.inspections || {}).length); bump("r", Object.keys(rivalCounts(M)).length); bump("d", Object.keys(M.pitches || {}).length + (M.assets ? 1 : 0));
+  PHASES.forEach(([k]) => { if (M.done[{ site: "questions", questions: "questions", ask: "ask", sources: "sources", think: "insights", draft: "draft" }[k]] || k === "site") finishPhase(k); });
+  thought(`<b>Picking up where I left off.</b> ${M.questions.length} questions and ${ans.filter((a) => a.status === "yes" || a.status === "no").length} answers are already saved. Nothing gets asked twice.`, "Runs are saved after every step, so leaving the page doesn't lose work.");
+  try { await runPipeline(M, sig); } catch (err) { missionError(err, sig); }
+}
+
+function missionError(err, sig) {
+  APP.running = false; if (APP.M) lockRelease(APP.M.slug);
+  if (APP.resuming) return; // the page came back from the background; resume handles the UI
+  const M = APP.M;
+  if (sig.aborted) {
+    thought("<b>Paused.</b> Everything so far is saved. You can resume any time or see results now.");
+    if (M) { save(); $("#toReport").hidden = false; }
+    const row = add(`<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" type="button" data-resume>Resume the agent</button><button class="btn ghost sm" type="button" data-home>← Back to start</button></div>`);
+    row.querySelector("[data-resume]").onclick = () => resumeMission(APP.M);
+    row.querySelector("[data-home]").onclick = goHome;
+    if (!M) row.querySelector("[data-resume]").remove();
+  } else {
+    add(`<span class="ic">!</span><div><span class="tx">${esc(err.message)}</span><span class="why">${M ? "Your progress is saved. Fix it and resume, or start again." : "Fix it and start again. Saved companies keep their profile."}</span></div>`, "step bad");
+    const row = add(`<div style="display:flex;gap:8px;flex-wrap:wrap">${M ? '<button class="btn sm" type="button" data-resume>Resume</button>' : ""}<button class="btn ghost sm" type="button" data-home>← Back to start</button></div>`);
+    row.querySelector("[data-resume]")?.addEventListener("click", () => resumeMission(APP.M));
+    row.querySelector("[data-home]").onclick = goHome;
+  }
+  $("#liveTag").className = "live off"; $("#liveTag").innerHTML = sig.aborted ? "<i></i>Paused" : "<i></i>Stopped"; $("#stopBtn").hidden = true;
+}
+
+async function runPipeline(M, sig) {
+  M.done = M.done || {};
+  const profile = M.profile;
     // ---------- 2. questions
+    if (!M.done.questions) {
+    M.questions = []; M.answers = {};
     phase("questions", 10, "Writing buyer questions");
     thought(`<b>Writing the questions a buyer types into ChatGPT</b> before choosing a ${esc(profile.category || "solution")}. I leave your name out on purpose.`, "We want to see whether AI brings you up on its own, the way a real buyer would experience it.");
     const qc = add(`<div class="hd"><span>Buyer questions</span><span class="sp"></span><span class="mono qn" style="font-size:.7rem">0</span></div><div class="ql"></div>`, "card hot");
@@ -338,15 +452,20 @@ async function startMission(url, saved) {
       delta: (d) => { buf += d.text; const lines = buf.split("\n"); buf = lines.pop(); lines.forEach(takeLine); },
       final: () => { if (buf.trim()) takeLine(buf); },
     }, sig);
-    qc.classList.remove("hot"); finishPhase("questions"); save();
-    renderMatrix($("#matrix"), M);
+    qc.classList.remove("hot");
+    if (!M.questions.length) throw new Error("The AI didn't return any buyer questions. Try again in a minute.");
+    M.done.questions = true; save(true);
+    }
+    finishPhase("questions"); renderMatrix($("#matrix"), M);
 
     // ---------- 3. ask AI live
     const engs = M.engines;
-    const jobs = []; for (const q of M.questions) for (const e of engs) jobs.push([q, e]);
+    const isDone = (a) => a && (a.status === "yes" || a.status === "no");
+    const jobs = []; for (const q of M.questions) for (const e of engs) if (!isDone(M.answers[q.id + "|" + e])) jobs.push([q, e]);
+    if (!M.done.ask && jobs.length) {
     phase("ask", 2, `Asking ${engs.map((e) => ENG[e]).join(", ")} live`);
-    thought(`<b>Asking ${engs.map((e) => ENG[e]).join(", ")} all ${M.questions.length} questions, live, with web search on.</b> ${jobs.length} conversations, 3 at a time. Watch who gets named and which pages they lean on.`, "This is exactly what your buyers see. Every page an engine cites is a lever we can pull.");
-    let done = 0; const rivalCount = {}; let firstYou = true;
+    thought(`<b>Asking ${engs.map((e) => ENG[e]).join(", ")} all ${M.questions.length} questions, live, with web search on.</b> ${jobs.length} conversations, 2 at a time. Watch who gets named and which pages they lean on.`, "This is exactly what your buyers see. Every page an engine cites is a lever we can pull.");
+    let done = 0; let firstYou = countNamed(M) === 0;
     const runOne = async ([q, e]) => {
       if (sig.aborted) return;
       const key = q.id + "|" + e; const a = (M.answers[key] = { qid: q.id, engine: e, status: "run", answer: "", sources: [], brands: [], searches: [] });
@@ -354,17 +473,19 @@ async function startMission(url, saved) {
       const card = add(`<div class="hd"><span class="eng"><i style="background:${ENGC[e]}"></i>${ENG[e]}</span><span class="sp"></span><span class="vd">${verdictHtml(a)}</span></div><div class="q">${esc(q.text)}</div><div class="status st">Connecting</div><div class="chips sq"></div><div class="answer typing"></div><div class="sr"></div>`, "card hot");
       const ansEl = card.querySelector(".answer"); let raf = 0;
       const paint = () => { raf = 0; ansEl.innerHTML = highlight(a.answer, M); ansEl.classList.toggle("short", a.answer.length < 400); scrollFeed(); };
+      for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        if (attempt > 1) { Object.assign(a, { status: "run", answer: "", sources: [], brands: [], searches: [], error: "" }); card.querySelector(".st").textContent = `Retrying (attempt ${attempt} of 3)`; card.querySelector(".sq").innerHTML = ""; }
         await stream("/api/ask", { engine: e, question: q.text, brand: profile }, {
           status: (d) => { card.querySelector(".st").textContent = d.text; },
           search: (d) => { a.searches.push(d.query); bump("s"); card.querySelector(".sq").insertAdjacentHTML("beforeend", `<span class="search">searched: ${esc(d.query)}</span>`); },
           source: (d) => {
             if (!a.sources.some((s) => s.url === d.url)) { a.sources.push(d); bump("src"); }
-            card.querySelector(".sr").innerHTML = srcChips(a.sources);
+            if (!card._srcT) card._srcT = later(() => { card._srcT = 0; card.querySelector(".sr").innerHTML = srcChips(a.sources); });
             const sid = sidOf(d.url);
             const sn = gNode(sid, "source", host(d.url), { url: d.url }); sn.weight = (sn.weight || 0) + 1; gLink("q:" + q.id, sid, "cited", "#3CC9B5");
           },
-          delta: (d) => { a.answer += d.text; if (!raf) raf = requestAnimationFrame(paint); },
+          delta: (d) => { a.answer += d.text; if (!raf) raf = later(paint); },
           final: (d) => {
             a.answer = d.answer || a.answer; a.sources = d.sources?.length ? d.sources : a.sources; a.brands = d.brands || []; a.model = d.model;
             const idx = a.brands.findIndex((b) => isYou(b, M));
@@ -372,11 +493,15 @@ async function startMission(url, saved) {
           },
         }, sig);
         if (a.status === "run") throw new Error("No answer came back");
+        break;
       } catch (err) {
         if (sig.aborted) return;
         a.status = "err"; a.error = err.message; card.querySelector(".st").textContent = err.message;
+        if (attempt < 3 && retryable(err)) { await sleep(2500 * attempt + Math.random() * 1500); continue; }
+        break;
       }
-      cancelAnimationFrame(raf); paint(); ansEl.classList.remove("typing"); card.classList.remove("hot");
+      }
+      raf = 0; paint(); ansEl.classList.remove("typing"); card.classList.remove("hot");
       card.querySelector(".vd").innerHTML = verdictHtml(a);
       card.querySelector(".st").textContent = a.status === "err" ? a.error : `${a.model || ""} · ${a.sources.length} sources · ${a.brands.length} brands named`;
       card.querySelector(".sr").innerHTML = srcChips(a.sources);
@@ -386,8 +511,8 @@ async function startMission(url, saved) {
         for (const b of a.brands) {
           if (isYou(b, M)) { gLink("q:" + q.id, "you", "named", "#FF7A1A"); continue; }
           const rid = "r:" + norm(b); const rn = gNode(rid, "rival", b); rn.weight = (rn.weight || 0) + 1; gLink("q:" + q.id, rid, "named", ({ chatgpt: "#45D19A", perplexity: "#5FA8FF", gemini: "#C9A2FF", groq: "#F5F5F3" })[e] || "#8A8A8E");
-          rivalCount[b] = (rivalCount[b] || 0) + 1; if (rivalCount[b] === 1) bump("r");
-          if (rivalCount[b] === 4) toast(`<b>${esc(b)}</b> has now been named 4 times. I'll check which pages carry it.`);
+          const rc = rivalCounts(M)[b] || 0; if (rc === 1) bump("r");
+          if (rc === 4) toast(`<b>${esc(b)}</b> has now been named 4 times. I'll check which pages carry it.`);
         }
         if (a.named && firstYou) { firstYou = false; toast(`${ENG[e]} named <b>${esc(profile.name)}</b>${a.rank ? " at #" + a.rank : ""} for “${esc(q.text)}”.`); }
         const v = liveScore(M); setRing(v);
@@ -395,22 +520,25 @@ async function startMission(url, saved) {
       renderMatrix($("#matrix"), M); save();
     };
     const queue = jobs.slice();
-    await Promise.all([0, 1, 2].map(async () => { while (queue.length && !sig.aborted) await runOne(queue.shift()); }));
-    finishPhase("ask");
+    await Promise.all([0, 1].map(async () => { while (queue.length && !sig.aborted) await runOne(queue.shift()); }));
+    }
+    if (sig.aborted) throw new DOMException("stopped", "AbortError");
+    M.done.ask = true; save(true); finishPhase("ask");
     const answered = Object.values(M.answers).filter((a) => a.status !== "err" && a.status !== "run");
-    const top = Object.entries(rivalCount).sort((a, b) => b[1] - a[1]);
+    if (!answered.length) throw new Error("None of the AI engines answered. Check your API key and quota, then resume.");
+    const top = Object.entries(rivalCounts(M)).sort((a, b) => b[1] - a[1]);
     thought(`<b>${countNamed(M)} of ${answered.length} answers named you.</b> ${top[0] ? `${esc(top[0][0])} was named ${top[0][1]} times${top[1] ? `, ${esc(top[1][0])} ${top[1][1]}` : ""}.` : ""}`);
 
     // ---------- 4. follow the sources
     const cites = {};
     for (const a of answered) for (const s of a.sources || []) { const k = s.url; (cites[k] = cites[k] || { url: k, n: 0, qs: new Set(), cited: false }); cites[k].n++; cites[k].qs.add(a.qid); cites[k].cited ||= s.cited; }
-    const targets = Object.values(cites).sort((a, b) => b.n - a.n || (b.cited ? 1 : 0) - (a.cited ? 1 : 0)).slice(0, 24);
-    if (targets.length && !sig.aborted) {
+    const targets = Object.values(cites).sort((a, b) => b.n - a.n || (b.cited ? 1 : 0) - (a.cited ? 1 : 0)).slice(0, 24).filter((t) => !M.inspections[t.url]);
+    if (!M.done.sources && targets.length && !sig.aborted) {
       phase("sources", 3, "Following the sources");
       thought(`<b>AI repeats what the web says.</b> The engines leaned on ${Object.keys(cites).length} pages. I'm opening the ${targets.length} that came up most to see who's on them.`, "If a rival is on the pages AI trusts and you're not, that's why it gets named. Those pages are your outreach list.");
       const ic = add(`<div class="hd"><span>Cited pages, opened</span><span class="sp"></span><span class="mono ipn" style="font-size:.7rem">0 / ${targets.length}</span></div><div class="irows"></div>`, "card hot");
       let k = 0; const q2 = targets.slice();
-      await Promise.all([0, 1, 2, 3, 4].map(async () => {
+      await Promise.all([0, 1, 2, 3].map(async () => {
         while (q2.length && !sig.aborted) {
           const t = q2.shift();
           let r; try { r = await post("/api/inspect", { url: t.url, brand: profile }, sig); } catch (e) { r = { ok: false, url: t.url, reason: e.message }; }
@@ -434,10 +562,12 @@ async function startMission(url, saved) {
       const tr = Object.entries(rc).sort((a, b) => b[1] - a[1])[0];
       thought(`<b>Found the pattern.</b> You're on ${onYou} of the ${opened.length} pages AI trusts.${tr ? ` ${esc(tr[0])} is on ${tr[1]}.` : ""} ${opened.length - onYou} pages are open targets.`, "Getting listed on these pages is the fastest way to start appearing in answers.");
     } else finishPhase("sources");
+    if (sig.aborted) throw new DOMException("stopped", "AbortError");
+    M.done.sources = true; save(true);
 
     // ---------- 5. what AI says about you + insights
     phase("think", 10, "Checking what AI says about you");
-    if (!sig.aborted) {
+    if (!M.done.perception && !sig.aborted) {
       thought(`<b>Now asking ${ENG[engs[0]]} what it knows about ${esc(profile.name)}</b>, then fact-checking every claim against your own site.`, "Wrong or outdated claims cost deals. You can't fix what you haven't seen.");
       const pq = [`What is ${profile.name}?`, `Is ${profile.name} a good choice for ${profile.category || "this"}? What are the alternatives?`];
       const pAns = [];
@@ -453,52 +583,50 @@ async function startMission(url, saved) {
       let raw = "";
       try { await stream("/api/write", { kind: "perception", data: { profile, answers: pAns } }, { delta: (d) => { raw += d.text; } }, sig); M.perception = parseLoose(raw); } catch { M.perception = null; }
       pc.classList.remove("hot");
+      if (!sig.aborted) M.done.perception = true;
       pc.querySelector(".body").outerHTML = M.perception ? `<p style="font-size:.88rem">${esc(M.perception.summary || "")}</p><div class="chips" style="flex-direction:column;align-items:flex-start">${(M.perception.claims || []).map((c) => `<div style="font-size:.84rem"><span class="chip ${c.verdict === "accurate" ? "ok" : c.verdict === "wrong" ? "no" : "rv"}">${esc(c.verdict)}</span> ${esc(c.claim)}</div>`).join("")}</div>` : `<p class="muted">Couldn't complete the fact-check.</p>`;
       save();
     }
-    if (!sig.aborted) {
+    if (!M.done.insights && !sig.aborted) {
       phase("think", 70, "Working out why");
       thought(`<b>Putting it together.</b> Here's my read of everything above.`);
       const ins = add(`<div class="hd"><span>Insights</span></div><div class="md typing"></div>`, "card hot");
       let t = "";
       await stream("/api/write", { kind: "insights", data: { profile, digest: digest(M) } }, { delta: (d) => { t += d.text; ins.querySelector(".md").innerHTML = md(t); scrollFeed(); } }, sig).catch(() => {});
-      M.insights = t; ins.querySelector(".md").classList.remove("typing"); ins.classList.remove("hot"); save();
+      M.insights = t; if (t && !sig.aborted) M.done.insights = true; ins.querySelector(".md").classList.remove("typing"); ins.classList.remove("hot"); save();
     }
     finishPhase("think");
 
     // ---------- 6. drafts
-    if (!sig.aborted) {
+    if (!M.done.draft && !sig.aborted) {
       phase("draft", 5, "Drafting your fixes");
       thought(`<b>Drafting the fixes.</b> Site code first, then personalised pitches for the pages where rivals are listed and you're not. You approve each one on the next screen.`, "Each draft is written for one specific page or gap. Nothing is generic.");
-      const s1 = stepEl("Writing llms.txt and company schema for your site");
-      let raw = ""; try { await stream("/api/write", { kind: "assets", data: { profile, pages: (M.audit.pages || []).slice(0, 10) } }, { delta: (d) => { raw += d.text; } }, sig); M.assets = parseLoose(raw); bump("d"); s1.done("llms.txt and company schema written"); } catch { s1.done("Couldn't write the site files", false); }
+      if (!M.assets) { const s1 = stepEl("Writing llms.txt and company schema for your site");
+      let raw = ""; try { await stream("/api/write", { kind: "assets", data: { profile, pages: (M.audit.pages || []).slice(0, 10) } }, { delta: (d) => { raw += d.text; } }, sig); M.assets = parseLoose(raw); bump("d"); s1.done("llms.txt and company schema written"); } catch { s1.done("Couldn't write the site files", false); } }
       phase("draft", 30);
-      const gaps = pitchTargets(M).slice(0, 3);
+      const gaps = pitchTargets(M).slice(0, 3).filter((t) => !M.pitches[t.url]);
       for (const [i, t] of gaps.entries()) {
         if (sig.aborted) break;
         const card = add(`<div class="hd"><span class="chip rv">pitch</span><span>${esc(t.domain)}</span><span class="sp"></span><span class="mono" style="font-size:.7rem">cited ${t.n}×</span></div><div class="pre typing"></div>`, "card hot");
         let txt = ""; await stream("/api/write", { kind: "pitch", data: { profile, t: { url: t.final || t.url, title: t.title, author: t.contacts?.author, rivals: t.rivals, questions: t.qs.map((q) => qText(M, q)), excerpt: t.excerpt } } }, { delta: (d) => { txt += d.text; card.querySelector(".pre").textContent = txt; scrollFeed(); } }, sig).catch(() => {});
-        M.pitches[t.url] = txt; card.querySelector(".pre").classList.remove("typing"); card.classList.remove("hot"); bump("d"); phase("draft", 30 + (i + 1) * 20); save();
+        if (txt) M.pitches[t.url] = txt; card.querySelector(".pre").classList.remove("typing"); card.classList.remove("hot"); bump("d"); phase("draft", 30 + (i + 1) * 20); save();
       }
+      if (!sig.aborted) M.done.draft = true; save();
       finishPhase("draft");
     }
+    if (sig.aborted) throw new DOMException("stopped", "AbortError");
 
     // ---------- done
-    M.finishedAt = Date.now(); save();
+    lockRelease(M.slug);
+    M.finishedAt = Date.now(); save(true);
     const mins = estimateMinutes(M);
     APP.running = false;
     $("#liveTag").className = "live off"; $("#liveTag").innerHTML = "<i></i>Done"; $("#hudPhase").textContent = `Finished · about ${(mins / 60).toFixed(1)} hours of work`;
     $("#stopBtn").hidden = true; $("#toReport").hidden = false;
-    add(`<div class="hd"><span class="chip ok">Mission complete</span></div><div class="q">${C.a} answers read, ${C.p} pages opened, ${C.d} drafts written. That's about ${(mins / 60).toFixed(1)} hours of manual work.</div><div><button class="btn" type="button" id="goResults">See your results →</button></div>`, "card hot");
-    $("#goResults").onclick = showReport;
-  } catch (err) {
-    APP.running = false;
-    if (sig.aborted) { thought("<b>Stopped.</b> Everything so far is saved."); if (APP.M) { APP.M.finishedAt = Date.now(); save(); $("#toReport").hidden = false; } }
-    else { add(`<span class="ic">!</span><div><span class="tx">${esc(err.message)}</span><span class="why">Fix it and start again. Saved companies keep their profile.</span></div>`, "step bad"); }
-    $("#liveTag").className = "live off"; $("#liveTag").innerHTML = "<i></i>Stopped"; $("#stopBtn").hidden = true;
-    const back = add(`<button class="btn ghost sm" type="button">← Back to start</button>`); back.querySelector("button").onclick = goHome;
-  }
+    const fin = add(`<div class="hd"><span class="chip ok">Mission complete</span></div><div class="q">${C.a} answers read, ${C.p} pages opened, ${C.d} drafts written. That's about ${(mins / 60).toFixed(1)} hours of manual work.</div><div><button class="btn" type="button" id="goResults">See your results →</button></div>`, "card hot");
+    fin.querySelector("#goResults").onclick = showReport;
 }
+
 $("#stopBtn").addEventListener("click", () => APP.ctl?.abort());
 $("#toReport").addEventListener("click", showReport);
 $$(".mobile-tabs button").forEach((b) => b.addEventListener("click", () => { $("#stage").dataset.view = b.dataset.view; $$(".mobile-tabs button").forEach((x) => x.setAttribute("aria-pressed", String(x === b))); if (b.dataset.view === "map") G.sim?.alpha(0.5).restart(); }));
@@ -599,9 +727,9 @@ function rebuildMap(M) {
   });
   Object.entries(M.inspections).forEach(([u, r]) => { const sid = sidOf(u); gNode(sid, "source", host(r.final || u), { url: u, inspected: true, you: !!r.you, rivals: (r.rivals || []).length }); if (r.you) gLink(sid, "you", "on", "#FF7A1A"); (r.rivals || []).forEach((rv) => gLink(sid, "r:" + norm(rv), "on", "#E2483D")); });
 }
-$("#rerun").addEventListener("click", () => { const M = APP.M; if (M) startMission(M.profile.site, { profile: M.profile }); });
+$("#rerun").addEventListener("click", async () => { const M = APP.M; if (!M) return; if (await lockedElsewhere(M.slug)) return toast("This brand is running in another tab right now."); startMission(M.profile.site, { profile: M.profile }); });
 $("#newBrand").addEventListener("click", goHome);
-function goHome() { APP.ctl?.abort(); $("#mission").hidden = true; $("#reportWrap").hidden = true; $("#landing").hidden = false; $("#startUrl").value = ""; renderRecent(); }
+function goHome() { if (APP.running) { APP.ctl?.abort(); } if (APP.M) lockRelease(APP.M.slug); $("#mission").hidden = true; $("#reportWrap").hidden = true; $("#landing").hidden = false; $("#startUrl").value = ""; renderRecent(); }
 
 /* ---------- action deck ---------- */
 let DECK = [], DI = 0;
@@ -683,6 +811,19 @@ async function ask(q) {
   catch (err) { t = t || "⚠️ " + err.message; }
   M.chat.push({ role: "ai", text: t }); save(); renderChat(); $("#chat").lastElementChild?.scrollIntoView({ behavior: "smooth", block: "end" });
 }
+
+/* =================================================================== LEAVING & COMING BACK */
+addEventListener("beforeunload", (e) => { if (APP.running) { save(true); e.preventDefault(); e.returnValue = ""; } });
+addEventListener("pagehide", () => { if (!APP.M) return; if (APP.running) save(true); try { localStorage.removeItem("wpetal:lock:" + APP.M.slug); } catch {} });
+addEventListener("pageshow", (e) => {
+  // Restored from the back/forward cache: open connections were cut while away, so resume from the saved state.
+  if (e.persisted && APP.running && APP.M) { APP.resuming = true; APP.ctl?.abort(); setTimeout(() => resumeMission(store.get("mission:" + APP.M.slug, APP.M)), 80); }
+  else if (e.persisted) renderRecent();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { if (APP.running) save(true); return; }
+  if (!$("#mission").hidden) { G.sim?.alpha(0.3).restart(); if (APP.M) renderMatrix($("#matrix"), APP.M); scrollFeed(); }
+});
 
 /* =================================================================== BOOT */
 (async () => {
