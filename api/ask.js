@@ -86,8 +86,31 @@ async function gemini(q, brand, send) {
   return { text, sources, model };
 }
 
-const RUN = { chatgpt, perplexity, gemini };
-const KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY" };
+// Groq Compound: an open model with built-in live web search (free tier, no card).
+async function groq(q, brand, send) {
+  const model = env("PETTLE_GROQ_ENGINE", "groq/compound-mini");
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${env("GROQ_API_KEY")}`, "content-type": "application/json" },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: q }], stream: true }) });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e?.error?.message || `Groq error ${res.status}`); }
+  send("status", { text: "Groq Compound is searching the web" });
+  let text = ""; const tools = []; const seen = new Set(); const sources = [];
+  const harvest = (obj) => {
+    const raw = JSON.stringify(obj || "");
+    for (const m of raw.matchAll(/"query\\?"\s*:\s*\\?"([^"\\]{3,200})/g)) if (!seen.has("q:" + m[1])) { seen.add("q:" + m[1]); send("search", { query: m[1] }); }
+    for (const m of raw.matchAll(/https?:\/\/[^\s"'\\)<>\]]+/g)) { const u = m[0].replace(/[.,;]+$/, ""); if (!seen.has(u) && !/groq\.com|googleapis|schema\.org/.test(u)) { seen.add(u); sources.push({ url: u, title: "", cited: true }); send("source", sources[sources.length - 1]); } }
+  };
+  for await (const { data } of readSSE(res)) {
+    const ch = data.choices?.[0] || {};
+    const d = ch.delta?.content; if (d) { text += d; send("delta", { text: d }); }
+    if (ch.delta?.executed_tools) { tools.push(...ch.delta.executed_tools); harvest(ch.delta.executed_tools); }
+    if (ch.message?.executed_tools) harvest(ch.message.executed_tools);
+  }
+  if (!sources.length) harvest(text);
+  return { text, sources: sources.slice(0, 20), model };
+}
+
+const RUN = { chatgpt, perplexity, gemini, groq };
+const KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY", groq: "GROQ_API_KEY" };
 
 export default async function handler(req) {
   const denied = guard(req); if (denied) return denied;

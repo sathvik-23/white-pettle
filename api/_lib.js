@@ -8,11 +8,21 @@ export const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.
 
 export const GEMINI_MODELS = () => [...new Set([env("PETTLE_GEMINI_MODEL", "gemini-flash-latest"), "gemini-2.5-flash", "gemini-2.0-flash"])];
 // Which model writes (questions, insights, pitches...). Free options first.
-export function llmProvider() {
+export function llmProviders() {
   const want = env("PETTLE_LLM_PROVIDER").toLowerCase();
   const have = { gemini: !!env("GEMINI_API_KEY"), groq: !!env("GROQ_API_KEY"), openai: !!env("OPENAI_API_KEY"), anthropic: !!env("ANTHROPIC_API_KEY") };
-  if (want && have[want]) return want;
-  return ["gemini", "groq", "openai", "anthropic"].find((k) => have[k]) || null;
+  const order = ["gemini", "groq", "openai", "anthropic"].filter((k) => have[k]);
+  if (want && have[want]) return [want, ...order.filter((k) => k !== want)];
+  return order;
+}
+export const llmProvider = () => llmProviders()[0] || null;
+// Quota, billing and rate-limit errors move on to the next configured provider.
+const isQuota = (e) => /quota|credit|billing|prepay|rate limit|429|exhausted|insufficient/i.test(String(e?.message || e));
+async function withFallback(fn) {
+  const list = llmProviders(); let last;
+  if (!list.length) throw new Error("No AI key configured. Add GEMINI_API_KEY (free) or GROQ_API_KEY (free) in your environment variables.");
+  for (const pv of list) { try { return await fn(pv); } catch (e) { last = e; if (!isQuota(e)) throw e; } }
+  throw last;
 }
 
 async function geminiCall(prompt, { stream = false, max = 4000, onDelta } = {}) {
@@ -43,6 +53,7 @@ export function engines() {
   if (env("OPENAI_API_KEY")) e.push("chatgpt");
   if (env("PERPLEXITY_API_KEY")) e.push("perplexity");
   if (env("GEMINI_API_KEY")) e.push("gemini");
+  if (env("GROQ_API_KEY")) e.push("groq");
   return e;
 }
 
@@ -217,8 +228,8 @@ export function snippetAround(text, name, width = 110) {
 }
 
 // ---------- LLM ----------
-export async function llmText(prompt, { model, max = 4000 } = {}) {
-  const pv = llmProvider();
+export async function llmText(prompt, opts = {}) { return withFallback((pv) => llmTextWith(pv, prompt, opts)); }
+async function llmTextWith(pv, prompt, { model, max = 4000 } = {}) {
   if (pv === "gemini") return geminiCall(prompt, { max });
   if (pv === "groq") return groqCall(prompt, { max });
   if (pv === "openai") {
@@ -248,8 +259,11 @@ export function openaiText(d) {
 }
 
 // Stream plain text from the writing model, calling onDelta for each chunk.
-export async function llmStream(prompt, onDelta, { model, max = 6000 } = {}) {
-  const pv = llmProvider();
+export async function llmStream(prompt, onDelta, opts = {}) {
+  let sent = false; const wrap = (d) => { sent = true; onDelta(d); };
+  return withFallback((pv) => { if (sent) throw new Error("stream interrupted"); return llmStreamWith(pv, prompt, wrap, opts); });
+}
+async function llmStreamWith(pv, prompt, onDelta, { model, max = 6000 } = {}) {
   if (pv === "gemini") return geminiCall(prompt, { stream: true, max, onDelta });
   if (pv === "groq") return groqCall(prompt, { stream: true, max, onDelta });
   if (pv === "openai") {
@@ -277,7 +291,7 @@ export async function extractBrands(answer, known) {
   const found = orderKnown(answer, known);
   if (!llmProvider()) return found;
   try {
-    const arr = await llmJSON(`List every brand, product, company or service this AI answer recommends or names, in the order they first appear. Exclude publishers and websites that are only cited as sources. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { model: llmProvider() === "openai" ? FAST_MODEL() : undefined, max: 600 });
+    const arr = await llmJSON(`List every brand, product, company or service this AI answer recommends or names, in the order they first appear. Exclude publishers and websites that are only cited as sources. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { max: 600 });
     const out = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim()).filter(Boolean);
     for (const k of found) if (!out.some((a) => norm(a) === norm(k))) out.push(k);
     return out.slice(0, 20);

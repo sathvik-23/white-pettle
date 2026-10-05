@@ -11,8 +11,8 @@ const host = (u) => { try { return new URL(String(u).includes("://") ? u : "http
 const slugify = (s) => norm(s).replace(/ /g, "-").slice(0, 48) || "brand";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } };
-const ENG = { chatgpt: "ChatGPT", perplexity: "Perplexity", gemini: "Gemini" };
-const ENGC = { chatgpt: "var(--e-chatgpt)", perplexity: "var(--e-perplexity)", gemini: "var(--e-gemini)" };
+const ENG = { chatgpt: "ChatGPT", perplexity: "Perplexity", gemini: "Gemini", groq: "Groq web" };
+const ENGC = { chatgpt: "var(--e-chatgpt)", perplexity: "var(--e-perplexity)", gemini: "var(--e-gemini)", groq: "var(--e-groq)" };
 const store = {
   get(k, d) { try { const v = localStorage.getItem("wpetal:" + k); return v ? JSON.parse(v) : d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch {} },
@@ -385,7 +385,7 @@ async function startMission(url, saved) {
         const qn = G.nodes.get("q:" + q.id); if (qn && a.named) { qn.named = true; }
         for (const b of a.brands) {
           if (isYou(b, M)) { gLink("q:" + q.id, "you", "named", "#FF7A1A"); continue; }
-          const rid = "r:" + norm(b); const rn = gNode(rid, "rival", b); rn.weight = (rn.weight || 0) + 1; gLink("q:" + q.id, rid, "named", ENGC[e].includes("chatgpt") ? "#45D19A" : ENGC[e].includes("perplexity") ? "#5FA8FF" : "#C9A2FF");
+          const rid = "r:" + norm(b); const rn = gNode(rid, "rival", b); rn.weight = (rn.weight || 0) + 1; gLink("q:" + q.id, rid, "named", ({ chatgpt: "#45D19A", perplexity: "#5FA8FF", gemini: "#C9A2FF", groq: "#F5F5F3" })[e] || "#8A8A8E");
           rivalCount[b] = (rivalCount[b] || 0) + 1; if (rivalCount[b] === 1) bump("r");
           if (rivalCount[b] === 4) toast(`<b>${esc(b)}</b> has now been named 4 times. I'll check which pages carry it.`);
         }

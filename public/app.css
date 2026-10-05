@@ -7,7 +7,7 @@
   --src:#3CC9B5; --src-wash:rgba(60,201,181,.13);
   --q:#A79BFF; --q-wash:rgba(167,155,255,.14);
   --good:#45D19A; --bad:#FF6B5A; --warn:#FFC46B;
-  --e-chatgpt:#45D19A; --e-perplexity:#5FA8FF; --e-gemini:#C9A2FF;
+  --e-chatgpt:#45D19A; --e-perplexity:#5FA8FF; --e-gemini:#C9A2FF; --e-groq:#F5F5F3;
   --f-display:"Geist",ui-sans-serif,-apple-system,"Helvetica Neue",Arial,sans-serif;
   --f-body:"Geist",ui-sans-serif,-apple-system,"Helvetica Neue",Arial,sans-serif;
   --f-mono:"Geist Mono",ui-monospace,Menlo,Consolas,monospace;

@@ -21,7 +21,7 @@ Or import the repo at [vercel.com/new](https://vercel.com/new) and add these **E
 | Name | Required | What it does |
 |---|---|---|
 | `GEMINI_API_KEY` | **free**, recommended | Gemini as a live engine with Google Search grounding, plus all AI writing. Get one at aistudio.google.com/apikey |
-| `GROQ_API_KEY` | free, optional | A fast, free writing model (Llama 3.3 70B) |
+| `GROQ_API_KEY` | **free**, no card | Groq Compound as a live engine with web search, plus a fast free writer (Llama 3.3 70B) |
 | `ACCESS_CODE` | recommended | Anyone using your link has to type this code before the agent runs |
 | `OPENAI_API_KEY` | paid, optional | Adds ChatGPT as a live engine |
 | `PERPLEXITY_API_KEY` | paid, optional | Adds Perplexity as a live engine |
