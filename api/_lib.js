@@ -329,11 +329,11 @@ async function llmStreamWith(pv, prompt, onDelta, { model, max = 6000 } = {}) {
   throw new Error("No AI key configured. Add GEMINI_API_KEY (free) or GROQ_API_KEY (free) in your environment variables.");
 }
 
-export async function extractBrands(answer, known) {
+export async function extractBrands(answer, known, category) {
   const found = orderKnown(answer, known);
   if (!llmProvider()) return found;
   try {
-    const arr = await llmJSON(`List every brand, product, company or service this AI answer recommends or names, in the order they first appear. Exclude publishers and websites that are only cited as sources. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { max: 600 });
+    const arr = await llmJSON(`List the companies or products this AI answer recommends or names as OPTIONS a buyer could choose${category ? ` for "${category}"` : ""}, in the order they first appear. Use each company's common name once (e.g. "Meta", not also "Meta Ads Manager"). Exclude publishers, review sites and websites only cited as sources, and exclude channels, platforms or tools that are merely mentioned as context rather than offered as an alternative. JSON array of strings.\n\nAnswer:\n${answer.slice(0, 9000)}`, { max: 600 });
     const out = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim()).filter(Boolean);
     for (const k of found) if (!out.some((a) => norm(a) === norm(k))) out.push(k);
     return out.slice(0, 20);

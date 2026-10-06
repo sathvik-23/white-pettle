@@ -126,7 +126,7 @@ export default async function handler(req) {
     if (!RUN[engine] || !env(KEY[engine])) throw new Error(`${engine} isn't set up. Add ${KEY[engine]} to the environment.`);
     const r = await RUN[engine](String(question || "").slice(0, 400), brand, send);
     send("status", { text: "Reading the answer for brand names" });
-    const brands = await extractBrands(r.text, [brand.name, ...(brand.competitors || [])].filter(Boolean));
-    send("final", { answer: r.text.slice(0, 6000), sources: r.sources.slice(0, 25), brands, model: r.model });
+    const brands = await extractBrands(r.text, [brand.name, ...(brand.competitors || [])].filter(Boolean), brand.category);
+    send("final", { answer: r.text.slice(0, 6000), sources: [...r.sources.filter((s) => s.cited), ...r.sources.filter((s) => !s.cited)].slice(0, 25), brands, model: r.model });
   });
 }

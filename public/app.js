@@ -91,6 +91,13 @@ function renderRecent() {
   const open = unfinished()[0];
   const res = open ? `<div class="resume" style="width:100%;display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap;margin-bottom:6px"><span style="color:var(--ink)">Your check of <b>${esc(open.profile.name)}</b> was interrupted.</span><button type="button" data-resume="${esc(open.slug)}" style="border-color:var(--petal);color:var(--ink)">Resume where it stopped</button><button type="button" data-discard="${esc(open.slug)}">Discard</button></div>` : "";
   $("#recent").innerHTML = res + (list.length ? `<span>Saved companies:</span>` + list.map((c) => `<button type="button" data-slug="${esc(c.slug)}">${esc(c.profile.name)}</button>`).join("") : "");
+  // Still running in another tab? Say so instead of calling it interrupted.
+  if (open) lockedElsewhere(open.slug).then((busy) => {
+    const box = $("#recent .resume"); if (!busy || !box) return;
+    box.querySelector("span").innerHTML = `<b>${esc(open.profile.name)}</b> is running in another tab right now.`;
+    const r = box.querySelector("[data-resume]"); r.textContent = "Continue here instead"; r.dataset.takeover = "1";
+    box.querySelector("[data-discard]")?.remove();
+  });
 }
 $("#startErr").addEventListener("click", (e) => { if (e.target.dataset.takeover) { localStorage.removeItem("wpetal:lock:" + (e.target.dataset.resume || e.target.dataset.slug)); $("#recent").dispatchEvent(new CustomEvent("takeover", { detail: e.target.dataset })); } });
 $("#recent").addEventListener("takeover", (e) => { const d = e.detail; const fake = { target: { dataset: { ...d } } }; recentClick(fake); });
@@ -104,6 +111,7 @@ async function recentClick(e) {
     return;
   }
   $("#startErr").textContent = "";
+  if (e.target.dataset.takeover && BC) { BC.postMessage({ type: "takeover", slug }); await sleep(500); }
   const m = store.get("mission:" + slug, null);
   if (r && m) return resumeMission(m);
   if (m && m.finishedAt && !m.abandoned) { APP.M = m; showReport(); } else { const c = store.get("companies", {})[slug]; if (c) startMission(c.profile.site, c); }
@@ -328,7 +336,7 @@ function newMission(profile, audit, siteText) {
 }
 let saveT = 0;
 function save(now) {
-  if (!APP.M) return;
+  if (!APP.M || APP.frozen === APP.M.slug) return;
   const run = () => { saveT = 0; APP.M.savedAt = Date.now(); store.set("mission:" + APP.M.slug, slim(APP.M)); if (APP.running) lockTouch(APP.M.slug); };
   if (now) { clearTimeout(saveT); return run(); }
   if (!saveT) saveT = setTimeout(run, 1500);
@@ -336,12 +344,17 @@ function save(now) {
 // Keep what the results need, drop bulk that only bloats storage.
 function slim(M) {
   const answers = {};
-  for (const [k, a] of Object.entries(M.answers || {})) answers[k] = { ...a, answer: String(a.answer || "").slice(0, 4000), sources: (a.sources || []).slice(0, 15), searches: (a.searches || []).slice(0, 6) };
+  for (const [k, a] of Object.entries(M.answers || {})) {
+    const src = a.sources || [], cited = src.filter((s) => s.cited), rest = src.filter((s) => !s.cited);
+    answers[k] = { ...a, answer: String(a.answer || "").slice(0, 4000), sources: [...cited, ...rest].slice(0, 20), searches: (a.searches || []).slice(0, 6),
+      nSrc: Math.max(a.nSrc || 0, src.length), nS: Math.max(a.nS || 0, (a.searches || []).length) };
+  }
   const inspections = {};
   for (const [k, p] of Object.entries(M.inspections || {})) inspections[k] = { ...p, excerpt: String(p.excerpt || "").slice(0, 600) };
   return { ...M, answers, inspections, siteText: String(M.siteText || "").slice(0, 6000) };
 }
 const later = (f) => (document.hidden ? setTimeout(f, 250) : requestAnimationFrame(f));
+const throttled = (f) => { let p = 0; return () => { if (!p) p = later(() => { p = 0; f(); }); }; };
 const retryable = (e) => /429|rate|limit|quota exceeded|overload|timed out|timeout|temporar|unavailable|502|503|504|network|fetch|stream/i.test(String(e?.message || e));
 function rivalCounts(M) { const rc = {}; Object.values(M.answers || {}).forEach((a) => (a.brands || []).forEach((b) => { if (!isYou(b, M)) rc[b] = (rc[b] || 0) + 1; })); return rc; }
 // One tab runs a brand at a time; other tabs see it's busy instead of overwriting each other.
@@ -350,7 +363,12 @@ function lockTouch(slug) { store.set("lock:" + slug, { tab: TAB, ts: Date.now() 
 function lockRelease(slug) { const l = store.get("lock:" + slug, null); if (l && l.tab === TAB) { try { localStorage.removeItem("wpetal:lock:" + slug); } catch {} } }
 // Ask other open tabs directly whether they are running this brand (no stale locks after a tab closes or navigates).
 const BC = "BroadcastChannel" in window ? new BroadcastChannel("wpetal") : null;
-if (BC) BC.onmessage = (ev) => { const d = ev.data || {}; if (d.type === "ping" && APP.running && APP.M && APP.M.slug === d.slug) BC.postMessage({ type: "pong", slug: d.slug }); };
+if (BC) BC.onmessage = (ev) => {
+  const d = ev.data || {}; const mine = APP.running && APP.M && APP.M.slug === d.slug;
+  if (d.type === "ping" && mine) BC.postMessage({ type: "pong", slug: d.slug });
+  // Another tab took this run over: save, stop here, and say where it went.
+  if (d.type === "takeover" && mine) { save(true); clearTimeout(saveT); saveT = 0; APP.frozen = d.slug; APP.handedOff = true; APP.ctl?.abort(); }
+};
 function lockedElsewhere(slug) {
   if (!BC) { const l = store.get("lock:" + slug, null); return Promise.resolve(!!(l && l.tab !== TAB && Date.now() - l.ts < 25000)); }
   return new Promise((done) => { let got = false; const h = (ev) => { if (ev.data?.type === "pong" && ev.data.slug === slug) got = true; }; BC.addEventListener("message", h); BC.postMessage({ type: "ping", slug }); setTimeout(() => { BC.removeEventListener("message", h); done(got); }, 350); });
@@ -361,7 +379,7 @@ function missionUI(title) {
   $("#landing").hidden = true; $("#reportWrap").hidden = true; $("#mission").hidden = false;
   $("#feed").innerHTML = ""; setupHud(); gInit(); setRing(null); $("#toReport").hidden = true; $("#stopBtn").hidden = false;
   $("#liveTag").className = "live"; $("#liveTag").innerHTML = "<i></i>Live"; $("#matrix").innerHTML = "";
-  APP.ctl?.abort(); APP.ctl = new AbortController(); APP.running = true; APP.resuming = false; stick = true;
+  APP.ctl?.abort(); APP.ctl = new AbortController(); APP.running = true; APP.resuming = false; APP.frozen = null; stick = true;
   $("#hudBrand").textContent = title;
   return APP.ctl.signal;
 }
@@ -389,7 +407,7 @@ async function startMission(url, saved) {
 
     // ---------- approval: the company profile
     if (saved?.profile) { result.profile = { ...result.profile, ...saved.profile, site: result.profile.site }; }
-    const profile = await approveProfile(result.profile, result.audit);
+    const profile = await approveProfile(result.profile, result.audit, !!saved?.profile);
     const cos = store.get("companies", {}); cos[slugify(profile.name)] = { slug: slugify(profile.name), profile, audit: result.audit, siteText: result.siteText, savedAt: Date.now() }; store.set("companies", cos);
     const prev = store.get("mission:" + slugify(profile.name), null); if (prev?.finishedAt) store.set("prev:" + slugify(profile.name), prev);
     APP.M = newMission(profile, result.audit, result.siteText); const M = APP.M; save();
@@ -405,7 +423,8 @@ async function resumeMission(M) {
   APP.M = M; M.done = M.done || {};
   rebuildMap(M); renderMatrix($("#matrix"), M); setRing(liveScore(M));
   const ans = Object.values(M.answers || {});
-  bump("q", M.questions.length); bump("a", ans.filter((a) => a.status === "yes" || a.status === "no").length); bump("src", ans.reduce((s, a) => s + (a.sources || []).length, 0)); bump("p", Object.keys(M.inspections || {}).length); bump("r", Object.keys(rivalCounts(M)).length); bump("d", Object.keys(M.pitches || {}).length + (M.assets ? 1 : 0));
+  const fin = ans.filter((a) => a.status === "yes" || a.status === "no");
+  bump("q", M.questions.length); bump("a", fin.length); bump("s", fin.reduce((s, a) => s + Math.max(a.nS || 0, (a.searches || []).length), 0)); bump("src", fin.reduce((s, a) => s + Math.max(a.nSrc || 0, (a.sources || []).length), 0)); bump("p", Object.keys(M.inspections || {}).length); bump("r", Object.keys(rivalCounts(M)).length); bump("d", Object.keys(M.pitches || {}).length + (M.assets ? 1 : 0));
   PHASES.forEach(([k]) => { if (M.done[{ site: "questions", questions: "questions", ask: "ask", sources: "sources", think: "insights", draft: "draft" }[k]] || k === "site") finishPhase(k); });
   thought(`<b>Picking up where I left off.</b> ${M.questions.length} questions and ${ans.filter((a) => a.status === "yes" || a.status === "no").length} answers are already saved. Nothing gets asked twice.`, "Runs are saved after every step, so leaving the page doesn't lose work.");
   try { await runPipeline(M, sig); } catch (err) { missionError(err, sig); }
@@ -416,6 +435,7 @@ function missionError(err, sig) {
   if (APP.resuming) return; // the page came back from the background; resume handles the UI
   const M = APP.M;
   if (sig.aborted) {
+    if (APP.handedOff) { APP.handedOff = false; thought("<b>This run moved to another tab.</b> It's continuing there, so this tab has stopped to avoid doing the work twice."); $("#liveTag").className = "live off"; $("#liveTag").innerHTML = "<i></i>Moved"; $("#stopBtn").hidden = true; const row = add(`<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn ghost sm" type="button" data-home>← Back to start</button></div>`); row.querySelector("[data-home]").onclick = goHome; return; }
     thought("<b>Paused.</b> Everything so far is saved. You can resume any time or see results now.");
     if (M) { save(); $("#toReport").hidden = false; }
     const row = add(`<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" type="button" data-resume>Resume the agent</button><button class="btn ghost sm" type="button" data-home>← Back to start</button></div>`);
@@ -475,12 +495,12 @@ async function runPipeline(M, sig) {
       const paint = () => { raf = 0; ansEl.innerHTML = highlight(a.answer, M); ansEl.classList.toggle("short", a.answer.length < 400); scrollFeed(); };
       for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        if (attempt > 1) { Object.assign(a, { status: "run", answer: "", sources: [], brands: [], searches: [], error: "" }); card.querySelector(".st").textContent = `Retrying (attempt ${attempt} of 3)`; card.querySelector(".sq").innerHTML = ""; }
+        if (attempt > 1) { Object.assign(a, { status: "run", answer: "", sources: [], brands: [], searches: [], error: "", nSrc: 0, nS: 0 }); card.querySelector(".st").textContent = `Retrying (attempt ${attempt} of 3)`; card.querySelector(".sq").innerHTML = ""; }
         await stream("/api/ask", { engine: e, question: q.text, brand: profile }, {
           status: (d) => { card.querySelector(".st").textContent = d.text; },
-          search: (d) => { a.searches.push(d.query); bump("s"); card.querySelector(".sq").insertAdjacentHTML("beforeend", `<span class="search">searched: ${esc(d.query)}</span>`); },
+          search: (d) => { a.searches.push(d.query); a.nS = (a.nS || 0) + 1; bump("s"); card.querySelector(".sq").insertAdjacentHTML("beforeend", `<span class="search">searched: ${esc(d.query)}</span>`); },
           source: (d) => {
-            if (!a.sources.some((s) => s.url === d.url)) { a.sources.push(d); bump("src"); }
+            if (!a.sources.some((s) => s.url === d.url)) { a.sources.push(d); a.nSrc = (a.nSrc || 0) + 1; bump("src"); }
             if (!card._srcT) card._srcT = later(() => { card._srcT = 0; card.querySelector(".sr").innerHTML = srcChips(a.sources); });
             const sid = sidOf(d.url);
             const sn = gNode(sid, "source", host(d.url), { url: d.url }); sn.weight = (sn.weight || 0) + 1; gLink("q:" + q.id, sid, "cited", "#3CC9B5");
@@ -571,17 +591,18 @@ async function runPipeline(M, sig) {
       thought(`<b>Now asking ${ENG[engs[0]]} what it knows about ${esc(profile.name)}</b>, then fact-checking every claim against your own site.`, "Wrong or outdated claims cost deals. You can't fix what you haven't seen.");
       const pq = [`What is ${profile.name}?`, `Is ${profile.name} a good choice for ${profile.category || "this"}? What are the alternatives?`];
       const pAns = [];
-      for (const qq of pq) {
-        if (sig.aborted) break;
+      // Both questions at once: half the wait.
+      await Promise.all(pq.map(async (qq, i) => {
+        if (sig.aborted) return;
         const card = add(`<div class="hd"><span class="eng"><i style="background:${ENGC[engs[0]]}"></i>${ENG[engs[0]]}</span><span class="chip you">about you</span></div><div class="q">${esc(qq)}</div><div class="answer typing"></div>`, "card hot");
-        const el = card.querySelector(".answer"); let t = "";
-        try { await stream("/api/ask", { engine: engs[0], question: qq, brand: profile }, { delta: (d) => { t += d.text; el.innerHTML = highlight(t, M); scrollFeed(); }, final: (d) => { t = d.answer || t; } }, sig); } catch (e) { t = t || e.message; }
-        el.classList.remove("typing"); el.innerHTML = highlight(t, M); card.classList.remove("hot"); pAns.push({ q: qq, a: t });
-      }
+        const el = card.querySelector(".answer"); let t = ""; const paintP = throttled(() => { el.innerHTML = highlight(t, M); scrollFeed(); });
+        try { await stream("/api/ask", { engine: engs[0], question: qq, brand: profile }, { delta: (d) => { t += d.text; paintP(); }, final: (d) => { t = d.answer || t; } }, sig); } catch (e) { t = t || e.message; }
+        el.classList.remove("typing"); el.innerHTML = highlight(t, M); card.classList.remove("hot"); pAns[i] = { q: qq, a: t };
+      }));
       phase("think", 45);
       const pc = add(`<div class="hd"><span>Fact-check</span><span class="sp"></span><svg class="pq think" viewBox="0 0 56 30" style="height:12px;width:22px;color:var(--muted)"><rect x="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/><rect x="20" width="16" height="30" rx="4.5" fill="#FF7A1A"/><rect x="40" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/></svg></div><div class="body status">Comparing claims with your site</div>`, "card hot");
       let raw = "";
-      try { await stream("/api/write", { kind: "perception", data: { profile, answers: pAns } }, { delta: (d) => { raw += d.text; } }, sig); M.perception = parseLoose(raw); } catch { M.perception = null; }
+      try { await stream("/api/write", { kind: "perception", data: { profile, answers: pAns.filter(Boolean) } }, { delta: (d) => { raw += d.text; } }, sig); M.perception = parseLoose(raw); } catch { M.perception = null; }
       pc.classList.remove("hot");
       if (!sig.aborted) M.done.perception = true;
       pc.querySelector(".body").outerHTML = M.perception ? `<p style="font-size:.88rem">${esc(M.perception.summary || "")}</p><div class="chips" style="flex-direction:column;align-items:flex-start">${(M.perception.claims || []).map((c) => `<div style="font-size:.84rem"><span class="chip ${c.verdict === "accurate" ? "ok" : c.verdict === "wrong" ? "no" : "rv"}">${esc(c.verdict)}</span> ${esc(c.claim)}</div>`).join("")}</div>` : `<p class="muted">Couldn't complete the fact-check.</p>`;
@@ -591,9 +612,9 @@ async function runPipeline(M, sig) {
       phase("think", 70, "Working out why");
       thought(`<b>Putting it together.</b> Here's my read of everything above.`);
       const ins = add(`<div class="hd"><span>Insights</span></div><div class="md typing"></div>`, "card hot");
-      let t = "";
-      await stream("/api/write", { kind: "insights", data: { profile, digest: digest(M) } }, { delta: (d) => { t += d.text; ins.querySelector(".md").innerHTML = md(t); scrollFeed(); } }, sig).catch(() => {});
-      M.insights = t; if (t && !sig.aborted) M.done.insights = true; ins.querySelector(".md").classList.remove("typing"); ins.classList.remove("hot"); save();
+      let t = ""; const paintI = throttled(() => { ins.querySelector(".md").innerHTML = md(t); scrollFeed(); });
+      await stream("/api/write", { kind: "insights", data: { profile, digest: digest(M) } }, { delta: (d) => { t += d.text; paintI(); } }, sig).catch(() => {});
+      ins.querySelector(".md").innerHTML = md(t); M.insights = t; if (t && !sig.aborted) M.done.insights = true; ins.querySelector(".md").classList.remove("typing"); ins.classList.remove("hot"); save();
     }
     finishPhase("think");
 
@@ -608,8 +629,8 @@ async function runPipeline(M, sig) {
       for (const [i, t] of gaps.entries()) {
         if (sig.aborted) break;
         const card = add(`<div class="hd"><span class="chip rv">pitch</span><span>${esc(t.domain)}</span><span class="sp"></span><span class="mono" style="font-size:.7rem">cited ${t.n}×</span></div><div class="pre typing"></div>`, "card hot");
-        let txt = ""; await stream("/api/write", { kind: "pitch", data: { profile, t: { url: t.final || t.url, title: t.title, author: t.contacts?.author, rivals: t.rivals, questions: t.qs.map((q) => qText(M, q)), excerpt: t.excerpt } } }, { delta: (d) => { txt += d.text; card.querySelector(".pre").textContent = txt; scrollFeed(); } }, sig).catch(() => {});
-        if (txt) M.pitches[t.url] = txt; card.querySelector(".pre").classList.remove("typing"); card.classList.remove("hot"); bump("d"); phase("draft", 30 + (i + 1) * 20); save();
+        let txt = ""; const paintD = throttled(() => { card.querySelector(".pre").textContent = txt; scrollFeed(); }); await stream("/api/write", { kind: "pitch", data: { profile, t: { url: t.final || t.url, title: t.title, author: t.contacts?.author, rivals: t.rivals, questions: t.qs.map((q) => qText(M, q)), excerpt: t.excerpt } } }, { delta: (d) => { txt += d.text; paintD(); } }, sig).catch(() => {});
+        card.querySelector(".pre").textContent = txt; if (txt) M.pitches[t.url] = txt; card.querySelector(".pre").classList.remove("typing"); card.classList.remove("hot"); bump("d"); phase("draft", 30 + (i + 1) * 20); save();
       }
       if (!sig.aborted) M.done.draft = true; save();
       finishPhase("draft");
@@ -659,7 +680,7 @@ function digest(M) {
 }
 
 /* ---------- approval card ---------- */
-function approveProfile(p, audit) {
+function approveProfile(p, audit, auto) {
   return new Promise((resolve) => {
     thought(`<b>Here's what I understood about the company.</b> Check it before I continue. I'll save it and use it for every question I ask AI.`, "Wrong rivals or the wrong category means asking AI the wrong questions.");
     const card = add(`<div class="hd"><span class="chip ok">Company profile</span><span class="sp"></span><span class="mono" style="font-size:.7rem">${esc(host(p.site))} · AI-readiness ${audit?.avg ?? "–"}/100</span></div>
@@ -680,7 +701,18 @@ function approveProfile(p, audit) {
     $("#pf-rivals").addEventListener("keydown", (e) => { if (e.target.id === "pf-add" && (e.key === "Enter" || e.key === ",")) { e.preventDefault(); const v = e.target.value.trim(); if (v) { rivals.push(v); draw(); $("#pf-add").focus(); } } });
     phase("site", 100, "Waiting for your approval");
     $("#liveTag").innerHTML = "<i></i>Your turn";
+    // A company approved before: carry on by itself after a few seconds unless you start editing.
+    let left = auto ? 8 : 0, timer = 0;
+    const stopAuto = () => { if (!timer) return; clearInterval(timer); timer = 0; $("#pf-ok").textContent = "Approve and continue"; };
+    if (auto) {
+      card.querySelector(".muted").textContent = "You approved this profile before. Edit anything to pause.";
+      $("#pf-ok").textContent = `Continue (${left})`;
+      timer = setInterval(() => { if (--left <= 0) { clearInterval(timer); timer = 0; $("#pf-ok").click(); } else $("#pf-ok").textContent = `Continue (${left})`; }, 1000);
+      card.addEventListener("focusin", (e) => { if (e.target.id !== "pf-ok") stopAuto(); });
+      card.addEventListener("pointerdown", (e) => { if (e.target.id !== "pf-ok") stopAuto(); });
+    }
     $("#pf-ok").addEventListener("click", () => {
+      if (timer) { clearInterval(timer); timer = 0; }
       const extra = $("#pf-add")?.value.trim(); if (extra) rivals.push(extra);
       const out = { ...p, name: $("#pf-name").value.trim() || p.name, category: $("#pf-cat").value.trim(), market: $("#pf-mkt").value.trim(), audience: $("#pf-aud").value.trim(), offer: $("#pf-offer").value.trim(), competitors: rivals };
       card.classList.remove("hot"); card.querySelectorAll("input,button").forEach((x) => (x.disabled = true)); $("#pf-ok").textContent = "Approved ✓";
@@ -705,7 +737,7 @@ function showReport() {
   const sov = [...rivals.slice(0, 6).map(([n, c]) => ({ n, c })), { n: M.profile.name, c: youN, you: true }].sort((a, b) => b.c - a.c);
   const max = Math.max(1, ...sov.map((x) => x.c));
   $("#hero").innerHTML = `<div class="big tnum">${score}<small>%</small></div>
-    <div><p class="line">${line}</p><div class="pills">${M.engines.map((e) => { const x = ans.filter((a) => a.engine === e); const v = x.length ? Math.round((100 * x.filter((a) => a.named).length) / x.length) : 0; return `<span class="pill">${ENG[e]} <b>${v}%</b></span>`; }).join("")}${pScore != null ? `<span class="pill ${score > pScore ? "up" : score < pScore ? "down" : ""}">${score >= pScore ? "▲" : "▼"} ${Math.abs(score - pScore)} pts since ${new Date(prev.startedAt).toLocaleDateString()}</span>` : ""}<span class="pill">${(estimateMinutes(M) / 60).toFixed(1)}h of work done</span></div></div>
+    <div><p class="line">${line}</p><div class="pills">${M.engines.map((e) => { const x = ans.filter((a) => a.engine === e); const v = x.length ? Math.round((100 * x.filter((a) => a.named).length) / x.length) : 0; return `<span class="pill">${ENG[e]} <b>${v}%</b></span>`; }).join("")}${pScore != null ? `<span class="pill ${score > pScore ? "up" : score < pScore ? "down" : ""}">${score === pScore ? `No change since last check (${new Date(prev.startedAt).toLocaleDateString()})` : `${score > pScore ? "▲" : "▼"} ${Math.abs(score - pScore)} pts since ${new Date(prev.startedAt).toLocaleDateString()}`}</span>` : ""}<span class="pill">${(estimateMinutes(M) / 60).toFixed(1)}h of work done</span></div></div>
     <div class="sov">${sov.map((x) => `<div class="r${x.you ? " you" : ""}"><span class="n">${esc(x.n)}</span><span class="b"><i style="width:${((100 * x.c) / max).toFixed(0)}%"></i></span><span class="c">${x.c}</span></div>`).join("")}</div>`;
   $("#insights").innerHTML = M.insights ? md(M.insights) : `<p class="muted">No insights for this run.</p>`;
   renderMatrix($("#matrixBig"), M, true);
@@ -774,7 +806,8 @@ $("#deck").addEventListener("click", async (e) => {
     const req = c.t ? { kind: "pitch", data: { profile: M.profile, t: { url: c.t.final || c.t.url, title: c.t.title, author: c.t.contacts?.author, rivals: c.t.rivals, questions: (c.t.qs || []).map((q) => qText(M, q)), excerpt: c.t.excerpt } } }
       : c.q ? { kind: "article", data: { profile: M.profile, question: c.q.text, rivals: [...new Set(M.engines.flatMap((e) => M.answers[c.q.id + "|" + e]?.brands || []))].filter((x) => !isYou(x, M)), siteText: M.siteText } }
       : { kind: "fixpack", data: { profile: M.profile, page: c.page, text: M.siteText } };
-    try { await stream("/api/write", req, { delta: (d) => { t += d.text; if (c.page) out.innerHTML = md(t); else out.textContent = t; out.scrollTop = out.scrollHeight; } }); }
+    const paintK = throttled(() => { if (c.page) out.innerHTML = md(t); else out.textContent = t; out.scrollTop = out.scrollHeight; });
+    try { await stream("/api/write", req, { delta: (d) => { t += d.text; paintK(); } }); }
     catch (err) { t = t || ""; toast(esc(err.message)); }
     if (c.t) M.pitches[c.t.url] = t; else if (c.q) M.articles[c.q.id] = t; else M.fixpack = t;
     save(); drawDeck();
@@ -806,18 +839,23 @@ async function ask(q) {
   const M = APP.M; M.chat = M.chat || []; const hist = M.chat.slice(-8);
   M.chat.push({ role: "me", text: q }); renderChat();
   const el = document.createElement("div"); el.className = "msg ai"; el.innerHTML = `<div class="md typing"></div>`; $("#chat").append(el); el.scrollIntoView({ behavior: "smooth", block: "end" });
-  let t = "";
-  try { await stream("/api/write", { kind: "chat", data: { context: digest(M) + (M.insights ? "\n\nINSIGHTS\n" + M.insights : ""), history: hist, question: q } }, { delta: (d) => { t += d.text; el.firstChild.innerHTML = md(t); el.scrollIntoView({ block: "end" }); } }); }
+  let t = ""; const paintC = throttled(() => { el.firstChild.innerHTML = md(t); el.scrollIntoView({ block: "end" }); });
+  try { await stream("/api/write", { kind: "chat", data: { context: digest(M) + (M.insights ? "\n\nINSIGHTS\n" + M.insights : ""), history: hist, question: q } }, { delta: (d) => { t += d.text; paintC(); } }); }
   catch (err) { t = t || "⚠️ " + err.message; }
   M.chat.push({ role: "ai", text: t }); save(); renderChat(); $("#chat").lastElementChild?.scrollIntoView({ behavior: "smooth", block: "end" });
 }
 
 /* =================================================================== LEAVING & COMING BACK */
-addEventListener("beforeunload", (e) => { if (APP.running) { save(true); e.preventDefault(); e.returnValue = ""; } });
-addEventListener("pagehide", () => { if (!APP.M) return; if (APP.running) save(true); try { localStorage.removeItem("wpetal:lock:" + APP.M.slug); } catch {} });
+// No "leave site?" prompt: the run is saved continuously and this tab picks it back up by itself when you return.
+const AUTO = "wpetal:auto";
+addEventListener("pagehide", () => {
+  if (!APP.M) return;
+  if (APP.running) { save(true); try { sessionStorage.setItem(AUTO, APP.M.slug); } catch {} }
+  try { localStorage.removeItem("wpetal:lock:" + APP.M.slug); } catch {}
+});
 addEventListener("pageshow", (e) => {
   // Restored from the back/forward cache: open connections were cut while away, so resume from the saved state.
-  if (e.persisted && APP.running && APP.M) { APP.resuming = true; APP.ctl?.abort(); setTimeout(() => resumeMission(store.get("mission:" + APP.M.slug, APP.M)), 80); }
+  if (e.persisted && APP.running && APP.M) { try { sessionStorage.removeItem(AUTO); } catch {} APP.resuming = true; APP.ctl?.abort(); setTimeout(() => resumeMission(store.get("mission:" + APP.M.slug, APP.M)), 80); }
   else if (e.persisted) renderRecent();
 });
 document.addEventListener("visibilitychange", () => {
@@ -832,6 +870,10 @@ document.addEventListener("visibilitychange", () => {
   try { APP.cfg = await (await fetch("/api/config")).json(); } catch { $("#startErr").textContent = "Can't reach the server."; }
   if (APP.cfg.access) { $("#accessRow").hidden = false; $("#accessCode").value = APP.code || ""; }
   if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").textContent = "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
+  // This tab was running a check when it navigated away or reloaded: carry on without asking.
+  let auto = null; try { auto = sessionStorage.getItem(AUTO); sessionStorage.removeItem(AUTO); } catch {}
+  const m = auto && store.get("mission:" + auto, null);
+  if (m && !m.finishedAt && m.profile && m.done && APP.cfg.engines?.length && !(await lockedElsewhere(auto))) return resumeMission(m);
   $("#startUrl").focus();
 })();
 })();
