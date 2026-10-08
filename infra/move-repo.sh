@@ -55,7 +55,10 @@ gh api "orgs/$ORG" --jq .login >/dev/null 2>&1 || {
 info "ok, logged in as $ME"
 
 step "[2] Transferring $OLD → $ORG/$NAME"
-NEW="$(gh api "repos/$ORG/$NAME" --jq .full_name 2>/dev/null || true)"
+# gh prints the error body (a JSON 404) on stdout when a repo is missing, so
+# trust its exit status, never just "some output came back".
+repo_name() { gh api "repos/$1" --jq .full_name 2>/dev/null || return 1; }
+NEW=""; if out="$(repo_name "$ORG/$NAME")"; then NEW="$out"; fi
 if [ -n "$NEW" ] && [ "$(echo "$NEW" | tr 'A-Z' 'a-z')" = "$(echo "$ORG/$NAME" | tr 'A-Z' 'a-z')" ]; then
   info "already in the organisation: $NEW"
 else
@@ -68,14 +71,16 @@ else
   fi
   info "transfer requested; waiting for it to finish"
   for i in $(seq 1 30); do
-    NEW="$(gh api "repos/$ORG/$NAME" --jq .full_name 2>/dev/null || true)"
-    [ -n "$NEW" ] && break
+    if out="$(repo_name "$ORG/$NAME")"; then NEW="$out"; break; fi
     sleep 2
   done
   [ -n "$NEW" ] || die "the transfer did not show up after 60 s. If the organisation needs an
     owner to accept incoming transfers, accept it, then re-run this script."
   info "moved: $NEW"
 fi
+
+case "$NEW" in */*) ;; *) die "unexpected repository name from GitHub: $NEW" ;; esac
+case "$NEW" in *[!A-Za-z0-9._/-]*) die "unexpected repository name from GitHub: $NEW" ;; esac
 
 step "[3] Pointing this clone at https://github.com/$NEW"
 git -C "$ROOT" remote set-url origin "https://github.com/$NEW.git"
