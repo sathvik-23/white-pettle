@@ -212,6 +212,13 @@ resource "google_cloud_run_v2_service" "whitepetal" {
       template[0].revision,
       client,
       client_version,
+      # Service-level scaling (not template.scaling, which this stack sets):
+      # `gcloud run services update` writes manual_instance_count = 0 and
+      # min_instance_count = 0 here. Without this, every apply after a deploy
+      # "updates" the service, which rolls a new revision of whatever image is
+      # current — and if that image is broken, the apply fails before
+      # bootstrap.sh can build the fixed one.
+      scaling,
     ]
   }
 
