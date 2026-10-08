@@ -42,7 +42,7 @@ resource "google_billing_budget" "whitepetal" {
       "COMMITTED_USAGE_DISCOUNT",
       "COMMITTED_USAGE_DISCOUNT_DOLLAR_BASE",
       "DISCOUNT",
-      "FEE_UTILIZATION_OFFSET",
+      # Not "FEE_UTILIZATION_OFFSET": the Budget API rejects it (400, not a valid credit type).
     ]
   }
 
