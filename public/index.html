@@ -15,7 +15,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/app.css?v=202610052145">
+<link rel="stylesheet" href="/app.css?v=202610081500">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 </head>
 <body>
@@ -67,30 +67,88 @@
   </div>
 </section>
 
-<!-- ============ REPORT ============ -->
-<section id="reportWrap" hidden>
-  <div id="report">
-    <div class="rhead">
-      <div class="wordmark"><svg class="pq" viewBox="0 0 56 30" aria-hidden="true"><rect x="0" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/><rect x="20" y="0" width="16" height="30" rx="4.5" fill="#FF7A1A"/><rect x="40" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/></svg><span>White Petal</span><span class="by">by Perfstaq</span></div>
-      <span class="sp"></span>
-      <div class="tabsw"><button type="button" id="viewLog" aria-pressed="false">Watch the agent</button><button type="button" aria-pressed="true">Results</button></div>
-      <button class="btn ghost sm" id="rerun" type="button">Run again</button>
-      <button class="btn ghost sm" id="newBrand" type="button">New brand</button>
-    </div>
-    <div class="hero" id="hero"></div>
-    <div class="panel"><h3>Why this is happening</h3><p class="sub">The agent's read of everything it saw, with the evidence behind it.</p><div class="md" id="insights"></div></div>
-    <div class="two">
-      <div class="panel"><div class="rhead"><h3>Your next moves</h3><span class="sp"></span><span class="deckbar" id="deckCount"></span></div><p class="sub">One at a time. <span class="kbd">→</span> do it, <span class="kbd">←</span> skip.</p><div class="deck" id="deck"></div></div>
-      <div class="panel"><h3>Question by question</h3><p class="sub">Each cell is one live AI answer. Click to read it.</p><div class="matrix" id="matrixBig"></div></div>
-    </div>
-    <div class="panel"><h3>Pages AI trusts in your category</h3><p class="sub">Every page the engines cited. Get on the red ones.</p><div id="sourcesList"></div></div>
-    <div class="chat" id="chat"></div>
+<!-- ============ ONBOARDING (Peec-style: one question at a time under a live preview of the app) ============ -->
+<section id="onboard" class="light stagepage" hidden>
+  <header class="ob-top">
+    <a class="ob-logo" href="/" aria-label="White Petal home"><svg class="pq" viewBox="0 0 56 30" aria-hidden="true"><rect x="0" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".35"/><rect x="20" y="0" width="16" height="30" rx="4.5" fill="#FF7A1A"/><rect x="40" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".35"/></svg></a>
+    <button class="pillbtn" id="obBack" type="button"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 18l-6-6 6-6"/></svg>Back</button>
+    <span class="sp"></span>
+    <span class="ob-site" id="obSite"></span>
+  </header>
+  <div class="ob-stage">
+    <div class="ob-frame" id="obFrame"></div>
+    <div class="ob-ask" id="obAsk" aria-live="polite"></div>
   </div>
-  <div class="dock"><div class="in"><div class="sugs" id="sugs"></div>
-    <form class="ask" id="askForm"><input id="askIn" type="text" placeholder="Ask the agent anything…  (press / to focus)" autocomplete="off" aria-label="Ask the agent"><button class="send" type="submit" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button></form></div></div>
+  <div class="ob-sheet-wrap" id="obSheet" hidden><div class="ob-sheet" role="dialog" aria-modal="true" aria-labelledby="obSheetTitle"><div class="ob-sheet-body" id="obSheetBody"></div><div class="ob-sheet-foot" id="obSheetFoot"></div></div></div>
+  <footer class="ob-legal"><span>©2026 Perfstaq</span><span class="sp"></span><span>White Petal</span></footer>
+</section>
+
+<!-- ============ READY (first-results reveal) ============ -->
+<section id="ready" class="light stagepage" hidden>
+  <header class="ob-top">
+    <a class="ob-logo" href="/" aria-label="White Petal home"><svg class="pq" viewBox="0 0 56 30" aria-hidden="true"><rect x="0" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".35"/><rect x="20" y="0" width="16" height="30" rx="4.5" fill="#FF7A1A"/><rect x="40" y="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".35"/></svg></a>
+    <button class="pillbtn" id="readyBack" type="button"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 18l-6-6 6-6"/></svg>Watch the agent</button>
+  </header>
+  <div class="ob-stage">
+    <div class="ob-frame tall" id="readyPreview"></div>
+    <div class="ob-ask"><h1 id="readyTitle"></h1><p id="readySub"></p><div class="ob-btns"><button class="btn" id="readyGo" type="button">See full results</button></div></div>
+  </div>
+  <footer class="ob-legal"><span>©2026 Perfstaq</span><span class="sp"></span><span>White Petal</span></footer>
+</section>
+
+<!-- ============ RESULTS DASHBOARD ============ -->
+<section id="reportWrap" class="light" hidden>
+  <div class="dash">
+    <aside class="side" id="side">
+      <div class="proj-wrap">
+        <button class="proj" id="projBtn" type="button" aria-haspopup="true" aria-expanded="false"><span class="av" id="projAv"></span><b id="projName"></b><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="proj-menu" id="projMenu" hidden></div>
+      </div>
+      <nav class="nav" id="nav">
+        <div class="grp">Home</div>
+        <button type="button" data-page="overview"><i data-ic="overview"></i>Overview</button>
+        <button type="button" data-page="site"><i data-ic="globe"></i>My website</button>
+        <div class="grp">Brand</div>
+        <button type="button" data-page="insights"><i data-ic="doc"></i>Insights</button>
+        <button type="button" data-page="perception"><i data-ic="smile"></i>Perception</button>
+        <div class="grp">Prompts</div>
+        <button type="button" data-page="prompts"><i data-ic="list"></i>All prompts</button>
+        <div class="grp">Sources</div>
+        <button type="button" data-page="domains"><i data-ic="link"></i>Domains</button>
+        <button type="button" data-page="gap"><i data-ic="gap"></i>Gap analysis</button>
+        <div class="grp">Optimize</div>
+        <button type="button" data-page="actions"><i data-ic="bolt"></i>Actions<span class="cnt" id="navActions"></span></button>
+        <div class="grp">Results</div>
+        <button type="button" data-page="ranking"><i data-ic="rank"></i>Ranking</button>
+        <button type="button" data-page="chats"><i data-ic="chat"></i>Chats</button>
+      </nav>
+      <div class="side-foot">
+        <button type="button" class="navlike" id="viewLog"><i data-ic="play"></i>Watch the agent</button>
+        <button type="button" class="navlike" id="newBrand"><i data-ic="plus"></i>New brand</button>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="top">
+        <button class="iconbtn" id="sideToggle" type="button" aria-label="Menu"><i data-ic="side"></i></button>
+        <span class="crumb" id="crumb"></span>
+        <span class="sp"></span>
+        <button class="btn ghost sm" id="agentBtn" type="button"><i data-ic="chat"></i>Agent</button>
+        <button class="btn sm" id="rerun" type="button">Run again</button>
+      </header>
+      <div class="filters" id="filters"></div>
+      <div class="pages" id="pages"></div>
+    </main>
+    <aside class="agent" id="agentPanel" hidden>
+      <div class="agent-hd"><b>Agent</b><span class="muted">Ask anything about this run</span><span class="sp"></span><button class="iconbtn" id="agentClose" type="button" aria-label="Close agent">✕</button></div>
+      <div class="chat" id="chat"></div>
+      <div class="agent-in"><div class="sugs" id="sugs"></div>
+        <form class="ask" id="askForm"><input id="askIn" type="text" placeholder="Ask the agent…  (press / to focus)" autocomplete="off" aria-label="Ask the agent"><button class="send" type="submit" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button></form>
+      </div>
+    </aside>
+  </div>
 </section>
 
 <div class="tip" id="tip" hidden></div>
-<script src="/app.js?v=202610052145"></script>
+<script src="/app.js?v=202610081500"></script>
 </body>
 </html>

@@ -1,16 +1,30 @@
 # White Petal by Perfstaq
 
-**Will AI recommend you?** Paste a website and watch an AI agent work it out live, step by step:
+**Will AI recommend you?** Paste a website. A short setup, modelled on Peec AI's onboarding, shows a live preview of your workspace filling in as you answer one question at a time:
 
-1. **Reads the site the way AI crawlers do.** It checks robots.txt access for GPTBot, PerplexityBot and ClaudeBot, looks for llms.txt, reads the sitemap, and scores your key pages for AI-readiness.
-2. **Builds the company profile and waits for your approval.** Once you approve, it saves the profile.
-3. **Writes the questions your buyers type into ChatGPT.** Your brand name is left out on purpose, to see whether AI brings you up on its own.
-4. **Asks ChatGPT, Perplexity and Gemini live, with web search on.** You see each search query, the answer streaming in, the sources it cites, and every brand it names highlighted.
-5. **Follows the sources.** It opens every page the engines cited and shows who's on it, with evidence and contacts.
-6. **Fact-checks what AI says about you.**
-7. **Explains why you win or lose**, then drafts the fixes: robots.txt lines, llms.txt, company schema, personalised pitches, full articles and page rewrites.
+1. **Brand profile.** The agent reads the site the way GPTBot and PerplexityBot do, then drafts your description, category, brand identity, products, personas and facts for you to review.
+2. **Where you sell.** This is the market AI should answer for.
+3. **Competitors.** Suggested from your profile. Remove or add.
+4. **Topics.** The themes buyers research, generated from your products.
+5. **Prompt focus.** Research, compare options, or take action. This sets the intent mix, prompts per topic, and AI engines.
+6. **Prompt set.** The questions arrive grouped by topic, tagged with intent and persona. Review them with coverage by persona, intent and engine. Your name is left out on purpose.
 
-Everything appears on a **live map** (you, rivals, questions, cited pages) that you can drag, zoom and click. The **results** screen has a question-by-question grid, an action deck you work through with ← and →, and an agent you can ask anything, with answers streamed back.
+**Run analysis** starts the live agent. It asks ChatGPT, Perplexity and Gemini every prompt with web search on, opens every page they cite, fact-checks what AI says about you, explains why you win or lose, and drafts the fixes (robots.txt lines, llms.txt, company schema, personalised pitches, articles, page rewrites). It also draws a live map you can drag, zoom and click.
+
+Then **"your workspace is ready"** reveals the first results. The **results dashboard** has these pages:
+
+- Overview: visibility, share of voice, position, strongest and weakest engine, a visibility chart, top brands, chats and top domains
+- All prompts
+- Chats, each with a details panel
+- Domains, with domain types
+- Gap analysis, with one-click pitches
+- Actions, worked through with ← and →
+- Ranking
+- Insights
+- Perception
+- My website
+
+There's also an **Agent** drawer you can ask anything. `docs/peec-onboarding-analysis.md` explains what we copied from Peec and why.
 
 ## Deploy your own (2 minutes)
 
