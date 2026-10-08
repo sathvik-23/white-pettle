@@ -535,7 +535,7 @@ span.fav.l{display:inline-flex;align-items:center;justify-content:center;font-si
 .segc button i{width:8px;height:8px;border-radius:50%}
 .segc button[aria-pressed="true"]{background:#fff;color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08)}
 .segc.inl{align-self:flex-start}
-.pages{flex:1}
+#pages{flex:1}
 .pg{max-width:1240px;width:100%;margin:0 auto;padding:22px 20px 80px;display:flex;flex-direction:column;gap:16px}
 .pg-hd h2{font-size:1.45rem;font-weight:600;letter-spacing:-.02em}
 .pg-hd p{color:var(--muted);margin-top:4px}
@@ -552,7 +552,7 @@ span.fav.l{display:inline-flex;align-items:center;justify-content:center;font-si
 .grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
 .grid2.eq > *{min-height:0}
 .grid2.act{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr)}
-.card{background:#fff;border:1px solid var(--line);border-radius:14px;min-width:0;overflow:hidden;display:flex;flex-direction:column}
+.light .card{background:#fff;border:1px solid var(--line);border-radius:14px;min-width:0;overflow:hidden;display:flex;flex-direction:column}
 .light .card{padding:0;gap:0}
 .card-h{display:flex;align-items:center;gap:7px;padding:13px 16px;border-bottom:1px solid var(--line);font-size:.92rem}
 .card-h b{font-weight:600}.card-h > span[title]{display:flex;color:var(--dim)}
@@ -734,3 +734,41 @@ span.fav.l{display:inline-flex;align-items:center;justify-content:center;font-si
   .fr-th:has(input) > span:not(:first-of-type),.fr-tr:has(input) > :nth-child(n+3){display:none}
   .ob-sheet-foot{flex-wrap:wrap}.ob-sheet-foot > .muted{flex-basis:100%}
 }
+
+/* ---------- metrics additions ---------- */
+.sent{display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+.sent i{width:7px;height:7px;border-radius:50%}
+.btnchip{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:9px;font-size:.84rem;box-shadow:inset 0 0 0 1px var(--line2);color:var(--ink)}
+.btnchip:hover{background:var(--panel2)}
+.btnchip .ic{color:var(--muted)}
+.grid2.rk{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}
+.scatter{width:100%;height:auto;padding:8px 10px 4px;display:block}
+.scatter .ax{stroke:var(--line2)}
+.scatter .axl{font-size:11px;fill:var(--muted)}
+.scatter circle{fill:#9A9AA0;fill-opacity:.8;stroke:#fff;stroke-width:1.5}
+.scatter circle.you{fill:var(--petal);fill-opacity:1}
+.scatter text{font-size:11px;fill:var(--ink)}
+.scatter text.you{font-weight:700;fill:var(--petal2)}
+.erow.you .en{font-weight:600}
+.erow .en .av,.erow .en .fav{margin-right:2px}
+.hm-wrap{overflow:auto}
+.tbl.hm th.c,.tbl.hm td.c{text-align:center}
+.hc{display:inline-block;min-width:52px;padding:5px 8px;border-radius:7px;font-size:.82rem;font-variant-numeric:tabular-nums}
+.hc.you{box-shadow:inset 0 0 0 1.5px var(--petal2)}
+/* running stage */
+.ob-prog.wide{width:min(520px,90%);margin-top:16px}
+.runsteps{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:12px}
+.runsteps span{display:inline-flex;align-items:center;gap:6px;font-size:.82rem;padding:5px 11px;border-radius:999px;background:#fff;box-shadow:inset 0 0 0 1px var(--line2);color:var(--muted)}
+.runsteps span.ok{color:var(--good);box-shadow:inset 0 0 0 1px rgba(22,149,95,.3)}
+.runsteps span.on{color:var(--ink);box-shadow:inset 0 0 0 1.5px #151516}
+.runsteps .spin{width:10px;height:10px;border-radius:50%;border:2px solid var(--line2);border-top-color:var(--petal);animation:spin .8s linear infinite;display:inline-block}
+#readyRun .ob-btns{margin-top:14px}
+.calm .vbar,.calm .hb,.calm .fr-tr,.calm .fr-row{animation:none}
+.vbar{transition:height .6s cubic-bezier(.2,.85,.25,1)}
+body.is-light .toast{background:#fff;color:var(--ink);border-color:var(--line2);box-shadow:0 20px 50px -20px rgba(0,0,0,.25)}
+body.is-light .toast{--ink:#151516}
+@media (max-width:860px){.grid2.rk{grid-template-columns:minmax(0,1fr)}}
+.kpis.k8{grid-template-columns:repeat(4,minmax(0,1fr))}
+.kpis.k8 .kpi:nth-child(4n){border-right:0}
+.kpis.k8 .kpi:nth-child(-n+4){border-bottom:1px solid var(--line)}
+@media (max-width:860px){.kpis.k8{grid-template-columns:repeat(2,minmax(0,1fr))}.kpis.k8 .kpi{border-bottom:1px solid var(--line)}}

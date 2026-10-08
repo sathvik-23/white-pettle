@@ -15,7 +15,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/app.css?v=202610081500">
+<link rel="stylesheet" href="/app.css?v=202610081520">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 </head>
 <body>
@@ -91,7 +91,7 @@
   </header>
   <div class="ob-stage">
     <div class="ob-frame tall" id="readyPreview"></div>
-    <div class="ob-ask"><h1 id="readyTitle"></h1><p id="readySub"></p><div class="ob-btns"><button class="btn" id="readyGo" type="button">See full results</button></div></div>
+    <div class="ob-ask"><h1 id="readyTitle"></h1><p id="readySub"></p><div id="readyRun"></div><div class="ob-btns"><button class="btn" id="readyGo" type="button">See full results</button></div></div>
   </div>
   <footer class="ob-legal"><span>©2026 Perfstaq</span><span class="sp"></span><span>White Petal</span></footer>
 </section>
@@ -121,6 +121,7 @@
         <div class="grp">Results</div>
         <button type="button" data-page="ranking"><i data-ic="rank"></i>Ranking</button>
         <button type="button" data-page="chats"><i data-ic="chat"></i>Chats</button>
+        <button type="button" data-page="fanouts"><i data-ic="search"></i>Fanouts</button>
       </nav>
       <div class="side-foot">
         <button type="button" class="navlike" id="viewLog"><i data-ic="play"></i>Watch the agent</button>
@@ -149,6 +150,6 @@
 </section>
 
 <div class="tip" id="tip" hidden></div>
-<script src="/app.js?v=202610081500"></script>
+<script src="/app.js?v=202610081520"></script>
 </body>
 </html>
