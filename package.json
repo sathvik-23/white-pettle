@@ -1,9 +1,16 @@
 {
-  "name": "white-pettle",
-  "version": "1.0.0",
+  "name": "white-petal",
+  "version": "2.0.0",
   "private": true,
-  "description": "White Pettle: an AI agent that gets your brand recommended by ChatGPT, Perplexity and Gemini.",
+  "description": "White Petal by Perfstaq: an AI agent that gets your brand recommended by ChatGPT, Perplexity, Gemini and Google AI Overviews.",
   "type": "module",
-  "scripts": { "dev": "node dev.mjs" },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch-path=server --watch-path=api server/index.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "engines": { "node": ">=20.6" },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
 }

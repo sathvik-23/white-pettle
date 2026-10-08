@@ -1,5 +1,6 @@
 // Ask one live AI engine one buyer question, streaming its search, sources and answer as they happen.
-import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText, GEMINI_MODELS, pickGroq, fetchRetry } from "./_lib.js";
+import { sse, guard, body, env, readSSE, ENGINE_MODEL, extractBrands, openaiText, GEMINI_MODELS, pickGroq, fetchRetry, serpConfig } from "./_lib.js";
+import * as serp from "../server/integrations/serp.mjs";
 export const config = { runtime: "edge" };
 
 const COUNTRY = { india: "IN", "united states": "US", usa: "US", us: "US", america: "US", uk: "GB", "united kingdom": "GB", britain: "GB", canada: "CA", australia: "AU", singapore: "SG", uae: "AE", dubai: "AE", germany: "DE", france: "FR" };
@@ -116,17 +117,39 @@ async function groq(q, brand, send) {
   return { text, sources: sources.slice(0, 20), model };
 }
 
-const RUN = { chatgpt, perplexity, gemini, groq };
-const KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY", groq: "GROQ_API_KEY" };
+// Google AI Overviews and AI Mode, through a paid SERP API (DataForSEO or SerpApi). Not a chat model: Google either
+// shows an AI answer for the query or it doesn't, so "absent" is a real result, recorded as an answer that names nobody.
+// One AI Overview call also returns the organic top 10, which is how White Petal ties AI visibility to classic rankings.
+async function aio(q, brand, send) {
+  const cfg = { ...serpConfig(), locationName: brand.market && !/global/i.test(brand.market) ? brand.market : undefined };
+  send("status", { text: "Searching Google for an AI Overview" });
+  return serpAnswer(await serp.aiOverview(cfg, q), send, "google-ai-overview");
+}
+async function aimode(q, brand, send) {
+  const cfg = { ...serpConfig(), locationName: brand.market && !/global/i.test(brand.market) ? brand.market : undefined };
+  send("status", { text: "Asking Google AI Mode" });
+  return serpAnswer(await serp.aiMode(cfg, q), send, "google-ai-mode");
+}
+function serpAnswer(r, send, model) {
+  const sources = (r.references || []).filter((x) => x.url).slice(0, 25).map((x) => ({ url: x.url, title: x.title || "", cited: true }));
+  sources.forEach((s) => send("source", s));
+  const text = r.present ? r.text || "(Google showed an AI answer with no readable text.)" : "";
+  if (text) send("delta", { text });
+  return { text, sources, model, present: !!r.present };
+}
+
+const RUN = { chatgpt, perplexity, gemini, groq, aio, aimode };
+const KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY", groq: "GROQ_API_KEY", aio: "SERP", aimode: "SERP" };
+const ready = (e) => (KEY[e] === "SERP" ? !!serpConfig() : !!env(KEY[e]));
 
 export default async function handler(req) {
   const denied = guard(req); if (denied) return denied;
   const { engine, question, brand = {} } = await body(req);
   return sse(async (send) => {
-    if (!RUN[engine] || !env(KEY[engine])) throw new Error(`${engine} isn't set up. Add ${KEY[engine]} to the environment.`);
+    if (!RUN[engine] || !ready(engine)) throw new Error(`${engine} isn't set up. Add ${KEY[engine] === "SERP" ? "DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD (or SERPAPI_KEY)" : KEY[engine]} to the environment.`);
     const r = await RUN[engine](String(question || "").slice(0, 400), brand, send);
     send("status", { text: "Reading the answer for brand names" });
-    const brands = await extractBrands(r.text, [brand.name, ...(brand.competitors || [])].filter(Boolean), brand.category);
-    send("final", { answer: r.text.slice(0, 6000), sources: [...r.sources.filter((s) => s.cited), ...r.sources.filter((s) => !s.cited)].slice(0, 25), brands, model: r.model });
+    const brands = r.text ? await extractBrands(r.text, [brand.name, ...(brand.competitors || [])].filter(Boolean), brand.category) : [];
+    send("final", { answer: r.text.slice(0, 6000), sources: [...r.sources.filter((s) => s.cited), ...r.sources.filter((s) => !s.cited)].slice(0, 25), brands, model: r.model, ...(r.present === false ? { present: false } : {}) });
   });
 }

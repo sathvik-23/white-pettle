@@ -9,56 +9,93 @@
 5. **Prompt focus.** Research, compare options, or take action. This sets the intent mix, prompts per topic, and AI engines.
 6. **Prompt set.** The questions arrive grouped by topic, tagged with intent and persona. Review them with coverage by persona, intent and engine. Your name is left out on purpose.
 
-**Run analysis** starts the live agent. It asks ChatGPT, Perplexity and Gemini every prompt with web search on, opens every page they cite, fact-checks what AI says about you, explains why you win or lose, and drafts the fixes (robots.txt lines, llms.txt, company schema, personalised pitches, articles, page rewrites). It also draws a live map you can drag, zoom and click.
+**Run analysis** starts the live agent. It asks ChatGPT, Perplexity, Gemini, Groq and Google's AI Overviews / AI Mode every prompt (1–3 times each, to average out run-to-run noise) with web search on, opens every page they cite, fact-checks what AI says about you, explains why you win or lose, and drafts the fixes (robots.txt lines, llms.txt, company schema, personalised pitches, articles, page rewrites). It also draws a live map you can drag, zoom and click.
 
 Then **"your workspace is ready"** reveals the first results. The **results dashboard** has these pages:
 
-- Overview: visibility, share of voice, position, strongest and weakest engine, a visibility chart, top brands, chats and top domains
-- All prompts
-- Chats, each with a details panel
-- Domains, with domain types
-- Gap analysis, with one-click pitches
-- Actions, worked through with ← and →
-- Ranking
-- Insights
-- Perception
-- My website
+- **Overview**: visibility score (0–100), visibility, share of voice, position, sentiment, win rate, used-as-source, strongest engine, a trend across checks, AI referral traffic (GA4), top brands, chats and top domains
+- **All prompts**, and **Mention gaps** (prompts where AI names rivals and never you, with a one-click draft page)
+- **Chats**, each with a details panel, and **Fanouts** (the searches AI ran)
+- **Domains**, plus **URLs & content types** (listicle, review site, forum, docs…, and where you stand on each)
+- **Gap analysis**, with one-click pitches
+- **Search rankings**: the searches AI ran, and where you rank for them on Google (Search Console, or a live top-10 check) and Bing
+- **Actions**, worked through with ← and →; **Ranking**; **Insights**; **Perception**
+- **My website**: crawler access, page scores (now with JS-only content, author and credentials, alt text, internal links, H1), the most common page problems, an entity check (Wikidata, Knowledge Graph, sameAs), AI crawler visits (Cloudflare) and Bing index status
+- **Settings**: weekly or daily checks that run on the server, answers per prompt, and integrations
 
-There's also an **Agent** drawer you can ask anything. `docs/peec-onboarding-analysis.md` explains what we copied from Peec and why.
+There's also an **Agent** drawer you can ask anything. `docs/peec-onboarding-analysis.md` explains what we copied from Peec and why, and **How we measure** on the dashboard defines every metric.
 
-## Deploy your own (2 minutes)
+## Accounts and scheduled checks
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsathvik-23%2Fwhite-pettle&project-name=white-petal&repository-name=white-petal&env=GEMINI_API_KEY,ACCESS_CODE&envDescription=Free%20Gemini%20key%20powers%20the%20agent.%20ACCESS_CODE%20stops%20strangers%20using%20your%20credits.&envLink=https%3A%2F%2Faistudio.google.com%2Fapikey)
+With a database, White Petal has accounts (email + password). Each account's brands, runs and integrations live in Postgres, so a run started in one browser is there in another, and **scheduled checks** keep running with the tab closed: Cloud Scheduler calls `POST /api/cron/tick` hourly and the server re-runs every brand that is due, using the same handlers as a live run. Without a database it still works as before, with everything kept in the browser.
 
-Or import the repo at [vercel.com/new](https://vercel.com/new) and add these **Environment Variables**:
+## Integrations (all free)
 
-| Name | Required | What it does |
+Connected per brand in **Settings**. Keys are encrypted at rest (AES-256-GCM with `APP_SECRET`).
+
+| Integration | What it adds |
+|---|---|
+| Bing Webmaster Tools | Bing queries and positions (ChatGPT search leans on Bing), index and crawl status, URL submission |
+| IndexNow | Pushes new or changed pages to Bing, Yandex and others in minutes |
+| Google Search Console + GA4 | Your Google positions for the searches AI runs; sessions from ChatGPT, Perplexity, Gemini, Copilot and Claude |
+| Cloudflare | Which AI crawlers hit your site, and how often |
+| Entity & Knowledge Graph | Wikidata, Google Knowledge Graph and sameAs checks |
+| Slack | A message after every scheduled check |
+
+## Hosting: Google Cloud
+
+Production runs on **Cloud Run** in PerfStaq's Google Cloud project, with a `whitepetal` database on PerfStaq's existing Cloud SQL instance. It scales to zero and adds roughly **₹55 a month** to the bill; `docs/gcp-cost-plan.md` has the numbers, and why Cloud Run rather than Kubernetes (GKE would cost ₹2,900–4,300 a month before any traffic). `docs/perfstaq-cost-review.md` lists savings for PerfStaq itself.
+
+**First deploy** (once, from a machine with `gcloud` and `terraform` logged in):
+
+```bash
+infra/bootstrap.sh       # terraform apply, stores keys, builds, deploys, sets GitHub variables
+```
+
+After that, every push to `main` runs the tests and deploys (`.github/workflows/ci.yml`, keyless via Workload Identity Federation). Infra changes go through `.github/workflows/terraform.yml`. Add or rotate a key with `infra/secrets.sh OPENAI_API_KEY`. Details: `infra/terraform/README.md`.
+
+| Key (Secret Manager `WHITEPETAL_<NAME>`) | Required | What it does |
 |---|---|---|
-| `GEMINI_API_KEY` | **free**, recommended | Gemini as a live engine with Google Search grounding, plus all AI writing. Get one at aistudio.google.com/apikey |
-| `GROQ_API_KEY` | **free**, no card | Groq Compound as a live engine with web search, plus a fast free writer (Llama 3.3 70B) |
-| `ACCESS_CODE` | recommended | Anyone using your link has to type this code before the agent runs |
-| `OPENAI_API_KEY` | paid, optional | Adds ChatGPT as a live engine |
-| `PERPLEXITY_API_KEY` | paid, optional | Adds Perplexity as a live engine |
+| `DATABASE_URL`, `APP_SECRET`, `CRON_SECRET` | set by Terraform | Database, sessions and encryption, the cron call |
+| `GEMINI_API_KEY` | **free**, recommended | Gemini as a live engine with Google Search grounding, plus all AI writing (aistudio.google.com/apikey) |
+| `GROQ_API_KEY` | **free** | Groq Compound as a live engine with web search, plus a fast writer |
+| `OPENAI_API_KEY`, `PERPLEXITY_API_KEY` | paid, optional | ChatGPT and Perplexity as live engines |
+| `DATAFORSEO_LOGIN` + `DATAFORSEO_PASSWORD`, or `SERPAPI_KEY` | optional | Google AI Overviews and AI Mode as engines, and live Google rankings |
+| `GOOGLE_OAUTH_CLIENT_ID` + `_SECRET` | free, optional | Search Console + GA4. Redirect URI `https://<your host>/api/oauth/google/callback` |
+| `GOOGLE_API_KEY` | free, optional | Knowledge Graph lookups for the entity check |
+| `ACCESS_CODE` | optional | Invite code required to sign up |
 
 The writing model is picked in this order: Gemini → Groq → OpenAI → Anthropic. Force one with `PETTLE_LLM_PROVIDER`.
 
-There's no build step and no database. Company profiles and runs are saved in each visitor's browser.
-
 ## Run locally
 
+With Docker (Postgres 17, like production):
+
 ```bash
-cp .env.example .env    # add your OPENAI_API_KEY
-node dev.mjs            # → http://localhost:3000   (Node 18+)
+cp .env.example .env.local   # add GEMINI_API_KEY at least
+docker compose up --build    # → http://localhost:8080
 ```
+
+Or with Node 22 and any Postgres:
+
+```bash
+npm ci
+cp .env.example .env.local   # add GEMINI_API_KEY, DATABASE_URL, APP_SECRET
+npm run dev                  # → http://localhost:3000, restarts on change
+npm test                     # set TEST_DATABASE_URL to also run the API tests
+```
+
+Leave `DATABASE_URL` empty to run without accounts, with everything in the browser.
 
 ## How it's built
 
-- `public/` is the whole interface: vanilla JS, d3 for the live map, and the Perfstaq brand system (Geist, the orange middle bar).
-- `api/` holds edge functions that stream Server-Sent Events:
+- `public/` is the whole interface: vanilla JS, d3 for the live map, and the Perfstaq brand system (Geist, the orange middle bar). No build step.
+- `api/` holds the handlers that stream Server-Sent Events:
   - `site` reads the website like a crawler
   - `ask` talks to the live engines, streaming their searches, sources and answer
   - `inspect` opens a cited page and checks who's on it
   - `write` streams all of the agent's writing
-- `dev.mjs` runs the exact same handlers locally.
+- `server/` is a small Node HTTP server around those handlers: accounts, brands, runs, integrations, the scheduled-check runner (`runner.mjs`, the same pipeline as the browser), Postgres migrations, and static files with brotli and caching.
+- `infra/` is Terraform plus the bootstrap and secrets scripts; `Dockerfile` builds the image Cloud Run runs.
 
-Rough cost per run (12 questions × 1 engine): $0.50–$2 in OpenAI usage. Each extra engine adds a similar amount.
+Rough cost per run (12 prompts × 1 engine × 1 answer): $0.50–$2 on OpenAI; close to nothing on Gemini's free tier. Each extra engine or answer-per-prompt multiplies that.

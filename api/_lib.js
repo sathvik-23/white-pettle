@@ -1,4 +1,4 @@
-// Shared helpers for White Pettle API routes (Vercel Edge + local dev server).
+// Shared helpers for White Petal API routes. Run by server/index.mjs (Cloud Run and local dev), in-process by server/runner.mjs.
 export const env = (k, d = "") => (globalThis.process?.env?.[k] ?? d);
 
 export const ENGINE_MODEL = () => env("PETTLE_OPENAI_MODEL", "gpt-5.5");
@@ -80,7 +80,14 @@ export function engines() {
   if (env("PERPLEXITY_API_KEY")) e.push("perplexity");
   if (env("GEMINI_API_KEY")) e.push("gemini");
   if (env("GROQ_API_KEY")) e.push("groq");
+  if (serpConfig()) e.push("aio", "aimode");
   return e;
+}
+// The platform's SERP API account (DataForSEO preferred, SerpApi otherwise), or null when neither is configured.
+export function serpConfig() {
+  if (env("DATAFORSEO_LOGIN") && env("DATAFORSEO_PASSWORD")) return { backend: "dataforseo", login: env("DATAFORSEO_LOGIN"), password: env("DATAFORSEO_PASSWORD") };
+  if (env("SERPAPI_KEY")) return { backend: "serpapi", apiKey: env("SERPAPI_KEY") };
+  return null;
 }
 
 export function guard(req) {
@@ -195,8 +202,28 @@ export function parsePage(url, body) {
   const text = stripHtml(body);
   const host = hostOf(url);
   const links = [...body.matchAll(/href=["'](https?:\/\/[^"']+)/gi)].map((m) => m[1]);
+  // Signals the video-era checklist asks for (E-E-A-T, crawlability) that a raw-HTML read can see.
+  const imgs = body.match(/<img\b[^>]*>/gi) || [];
+  const withAlt = imgs.filter((t) => /\balt=["'][^"']{2,}["']/i.test(t)).length;
+  const hrefs = [...body.matchAll(/href=["']([^"'#?]+)/gi)].map((m) => m[1]);
+  const internal = new Set(hrefs.filter((h) => (h.startsWith("/") && !h.startsWith("//")) || hostOf(h) === host).map((h) => h.replace(/\/$/, ""))).size;
+  const scripts = (body.match(/<script\b/gi) || []).length;
+  const appShell = /<div[^>]+id=["'](root|app|__next|__nuxt|svelte)["'][^>]*>\s*<\/div>/i.test(body);
+  const author = /rel=["']author["']|itemprop=["']author["']|"author"\s*:\s*[{"[]|class=["'][^"']*\b(author|byline)\b|\b(written|reviewed|posted) by\b|about the author/i.test(body);
+  const credentials = author && /\b(ph\.?d|m\.?d\.|cpa|certified|years of experience|founder|ceo|cto|head of|director|professor|editor|expert)\b/i.test(text);
   return { url, title: title.slice(0, 200), description: desc.slice(0, 300), headings: heads, firstP: (paras[0] || "").slice(0, 800), text: text.slice(0, 20000), words: text.split(" ").length,
-    schema: ldTypes(body), outbound: links.filter((l) => !hostOf(l).endsWith(host)).length, lists: (body.match(/<li[\s>]/gi) || []).length, tables: (body.match(/<table[\s>]/gi) || []).length };
+    schema: ldTypes(body), outbound: links.filter((l) => !hostOf(l).endsWith(host)).length, lists: (body.match(/<li[\s>]/gi) || []).length, tables: (body.match(/<table[\s>]/gi) || []).length,
+    imgs: imgs.length, imgsWithAlt: withAlt, internal, h1: (body.match(/<h1[\s>]/gi) || []).length, scripts, jsOnly: text.split(" ").length < 150 && (appShell || scripts >= 8),
+    author, credentials, org: orgSchema(body) };
+}
+
+// The homepage's Organization JSON-LD (name, url, sameAs...), so entity checks can compare it with Wikidata.
+export function orgSchema(body) {
+  const ORG = /Organization|Corporation|LocalBusiness|ProfessionalService|Company/;
+  let found = null;
+  const walk = (o) => { if (found || !o || typeof o !== "object") return; if (Array.isArray(o)) return o.forEach(walk); const t = [].concat(o["@type"] || []).join(" "); if (ORG.test(t)) { found = { name: o.name || null, url: o.url || null, sameAs: [].concat(o.sameAs || []).filter((x) => typeof x === "string").slice(0, 20), logo: typeof o.logo === "string" ? o.logo : o.logo?.url || null, description: o.description ? String(o.description).slice(0, 300) : null }; return; } Object.values(o).forEach(walk); };
+  for (const m of body.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) { try { walk(JSON.parse(m[1].trim())); } catch {} if (found) break; }
+  return found;
 }
 
 export function scorePage(p, brand) {
@@ -221,6 +248,12 @@ export function scorePage(p, brand) {
     ["Shows it's current", fresh, 6, "Assistants prefer pages with a visible update date."],
     ["Names the brand clearly", brandN >= 3, 6, "AI needs to see who is speaking."],
     ["Enough depth", p.words >= 600, 4, "Thin pages rarely get cited."],
+    ["Readable without JavaScript", !p.jsOnly, 12, "Most AI crawlers don't run JavaScript. If the words only appear after scripts run, GPTBot and PerplexityBot see an empty page."],
+    ["Shows who wrote it", !!p.author, 5, "A named author (with credentials) is an E-E-A-T signal: AI prefers sources it can attribute."],
+    ["Author credentials", !!p.credentials, 3, "Say why the author is worth listening to: role, years, qualifications."],
+    ["Images have alt text", !p.imgs || p.imgsWithAlt / p.imgs >= 0.8, 3, "AI crawlers read alt text as content; an image without it says nothing to them."],
+    ["Links to related pages", (p.internal || 0) >= 5, 3, "Internal links help crawlers find, and connect, your other pages on the topic."],
+    ["One clear H1", p.h1 === 1, 2, "A single H1 tells machines what the page is about."],
   ];
   const tot = checks.reduce((s, c) => s + c[2], 0);
   const score = Math.round((100 * checks.filter((c) => c[1]).reduce((s, c) => s + c[2], 0)) / tot);

@@ -1,0 +1,222 @@
+name: CI
+
+# ONE WORKFLOW: checks, then deploy, in a single run (the shape PerfStaq
+# settled on after two chained workflows produced a "skipped" Deploy that read
+# like a failure of its own). A merge to main runs the checks and, if they
+# pass, deploys. One run, one answer, one place to look.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Redeploy main without a commit (e.g. after `terraform apply` recreated the
+  # service). From any other branch this runs the checks only — see `deploy.if`.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # NEVER on main: cancelling a main run can interrupt a rollout half-way.
+  # On a PR branch a newer push makes the older run worthless, so cancel it
+  # and save the minutes.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Least privilege by default; the deploy job adds id-token for WIF.
+permissions:
+  contents: read
+
+jobs:
+  # ── THE GATE ──────────────────────────────────────────────────────────────
+  check:
+    name: syntax · tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Real Postgres 17 — the major perfstaq-pg runs — so the server tests
+    # exercise the actual migrations. The tests use TEST_DATABASE_URL when it
+    # is set and skip the DB-backed cases when it is not, so a laptop without
+    # Postgres can still run `npm test`.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: whitepetal_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/whitepetal_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # the image's major (Dockerfile); test what ships
+          cache: npm
+
+      # `npm ci`, not `npm install`: a lockfile that disagrees with
+      # package.json fails here instead of resolving something untested.
+      - run: npm ci --no-audit --no-fund
+
+      # Every server, API and browser file must at least PARSE. There is no
+      # build step to catch a stray brace in public/app.js, and the browser
+      # would otherwise be the first thing to find it — in production.
+      - name: Syntax check (node --check)
+        run: |
+          find api server public -type f \( -name '*.js' -o -name '*.mjs' \) -print0 \
+            | xargs -0 -r -n1 -t node --check
+
+      - run: npm test
+
+  # ── DEPLOY ────────────────────────────────────────────────────────────────
+  deploy:
+    name: deploy to Cloud Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [check]
+    # ONLY main, never a pull request. A dispatch from another branch runs
+    # the checks and stops here: deploying a feature branch to production by
+    # clicking the wrong dropdown is not a feature.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    # Its own group, separate from the workflow's: two merges in quick
+    # succession queue, they never interleave or cancel a rollout.
+    concurrency:
+      group: deploy-whitepetal
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write # the OIDC token Workload Identity Federation exchanges
+
+    # Repository VARIABLES (not secrets — none of these is sensitive; the WIF
+    # provider only mints tokens for this repository). Set by
+    # infra/bootstrap.sh from the Terraform outputs.
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT }}
+      REGION: ${{ vars.GCP_REGION }}
+      REGISTRY: ${{ vars.GCP_REGISTRY }}
+      SERVICE: whitepetal
+      IMAGE: ${{ vars.GCP_REGISTRY }}/whitepetal
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail with a sentence, not with "invalid_target" from the auth action.
+      - name: Check repository variables
+        run: |
+          for v in GCP_WIF_PROVIDER GCP_DEPLOYER_SA GCP_PROJECT GCP_REGION GCP_REGISTRY; do
+            [ -n "${!v:-}" ] || { echo "::error::repository variable $v is not set — run infra/bootstrap.sh"; exit 1; }
+          done
+        env:
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_DEPLOYER_SA: ${{ vars.GCP_DEPLOYER_SA }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_REGISTRY: ${{ vars.GCP_REGISTRY }}
+
+      # No service-account JSON anywhere. The token this mints lasts minutes
+      # and is only issued to this repository (attribute_condition in
+      # infra/terraform/github.tf).
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+      # Buildx so the layer cache can live in the GitHub Actions cache
+      # (type=gha): a commit that changes only server/ reuses the npm ci
+      # layer and rebuilds in seconds. The cache is free (10 GB per repo) and
+      # costs nothing in Artifact Registry, unlike a registry-hosted cache,
+      # which would be billed storage. Runners are amd64, like Cloud Run, so
+      # no emulation is involved.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Load into the runner's docker FIRST, so the smoke test below can
+          # run the exact image before anything is pushed.
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boot the image exactly as Cloud Run would (PORT=8080, no database, no
+      # Secret Manager) and require /api/health to answer. Catches the
+      # failures a unit test cannot: a runtime directory the Dockerfile does
+      # not COPY, a dependency in devDependencies, a crash at import time.
+      # Cheaper here than as a failed revision, and nothing has been pushed.
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name smoke -p 8080:8080 -e PORT=8080 "$IMAGE:$GITHUB_SHA"
+          for _ in $(seq 1 30); do
+            body=$(curl -fsS http://127.0.0.1:8080/api/health 2>/dev/null) && break
+            sleep 1
+          done
+          echo "health: ${body:-<none>}"
+          if ! echo "${body:-}" | grep -q '"ok":true'; then
+            echo "::error::the image did not answer /api/health with ok:true"
+            docker logs smoke
+            exit 1
+          fi
+          docker rm -f smoke >/dev/null
+
+      - name: Push
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+      # `services update`, not `gcloud run deploy`: the service, its env,
+      # scaling and Cloud SQL volume are Terraform's. This changes the image
+      # and nothing else. Cloud Run only moves traffic once the new revision
+      # passes its startup probe, so a broken image never takes traffic.
+      - name: Deploy
+        run: |
+          gcloud run services update "$SERVICE" \
+            --project="$PROJECT_ID" --region="$REGION" \
+            --image="$IMAGE:$GITHUB_SHA" --quiet
+
+      # A deploy that reports success without checking is a deploy that
+      # reports success when the container crashloops or the DB is gone.
+      - name: Verify health
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')
+          echo "URL=$URL" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            body=$(curl -sS --max-time 15 "$URL/api/health" || true)
+            if echo "$body" | grep -q '"ok":true' && echo "$body" | grep -q '"db":true'; then
+              echo "healthy: $body"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$URL/api/health did not report ok:true and db:true — last answer: ${body:-<none>}"
+          exit 1
+
+      # UNAUTHENTICATED reachability, checked separately — PerfStaq's lesson.
+      # apps.perfstaq.com served a bare 403 to real users while CI reported a
+      # green deploy, because the invoker IAM check had drifted back ON and
+      # nothing checked the page people actually load.
+      #
+      # 403 is the specific failure (Cloud Run's answer when the invoker check
+      # is on). Do not "improve" this to expect 200: the point is "was the
+      # request let in", not "what did the app answer".
+      - name: Verify public reachability
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$URL/") || true
+          if [ "$code" = "403" ]; then
+            echo "::error::$SERVICE is NOT public (403). Fix: gcloud run services update $SERVICE --region=$REGION --no-invoker-iam-check"
+            exit 1
+          fi
+          echo "$URL/ reachable (HTTP $code)"

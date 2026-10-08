@@ -1,0 +1,53 @@
+name: Terraform
+
+# Static checks for infra/terraform — formatting and validity. NO plan and no
+# apply: those need credentials for a project PerfStaq's customers run in, and
+# they stay a deliberate act from a laptop (infra/bootstrap.sh). This catches
+# the cheap mistakes — a typo'd argument, an unformatted file — on the PR.
+on:
+  pull_request:
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/terraform.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: fmt · validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # >= versions.tf's required_version; pinned so a new Terraform
+          # release cannot turn a green PR red overnight.
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -diff -recursive
+
+      # -backend=false: no state, no credentials. Providers come from the
+      # public registry, verified against .terraform.lock.hcl (the same pins
+      # as PerfStaq's stack).
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate

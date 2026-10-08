@@ -12,8 +12,11 @@ const host = (u) => { try { return new URL(String(u).includes("://") ? u : "http
 const slugify = (s) => norm(s).replace(/ /g, "-").slice(0, 48) || "brand";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } };
-const ENG = { chatgpt: "ChatGPT", perplexity: "Perplexity", gemini: "Gemini", groq: "Groq web" };
-const ENGC = { chatgpt: "var(--e-chatgpt)", perplexity: "var(--e-perplexity)", gemini: "var(--e-gemini)", groq: "var(--e-groq)" };
+const ENG = { chatgpt: "ChatGPT", perplexity: "Perplexity", gemini: "Gemini", groq: "Groq web", aio: "AI Overviews", aimode: "AI Mode" };
+const ENGC = { chatgpt: "var(--e-chatgpt)", perplexity: "var(--e-perplexity)", gemini: "var(--e-gemini)", groq: "var(--e-groq)", aio: "var(--e-aio)", aimode: "var(--e-aimode)" };
+// Answers are keyed question|engine for the first sample and question|engine|n for repeats (sampling).
+const akey = (qid, e, s) => (s ? `${qid}|${e}|${s}` : `${qid}|${e}`);
+const answersOf = (M, qid, e) => Object.values(M.answers || {}).filter((a) => a.qid === qid && a.engine === e);
 const store = {
   get(k, d) { try { const v = localStorage.getItem("wpetal:" + k); return v ? JSON.parse(v) : d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch { try { for (let i = localStorage.length - 1; i >= 0; i--) { const kk = localStorage.key(i); if (kk && kk.startsWith("wpetal:prev:")) localStorage.removeItem(kk); } localStorage.setItem("wpetal:" + k, JSON.stringify(v)); } catch {} } },
@@ -23,7 +26,7 @@ const store = {
 const APP = { cfg: { engines: [], llm: false, access: false }, code: store.get("code", ""), M: null, ctl: null, running: false };
 async function post(path, payload, signal) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
-  if (r.status === 401) throw new Error("The access code is missing or wrong.");
+  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } throw new Error("The access code is missing or wrong."); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
   return d;
@@ -40,7 +43,7 @@ async function stream(path, payload, on, signal, idleMs = 75000) {
 }
 async function streamInner(path, payload, on, signal, kick) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
-  if (r.status === 401) throw new Error("The access code is missing or wrong.");
+  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } throw new Error("The access code is missing or wrong."); }
   if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
   const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", err = null;
   for (;;) {
@@ -60,9 +63,154 @@ async function streamInner(path, payload, on, signal, kick) {
   if (err) throw err;
 }
 
+/* =================================================================== ACCOUNTS + DATA
+   With a database (Cloud Run), brands and runs live on the server, per account, and scheduled checks keep adding
+   runs. Without one (a plain local run), everything stays in this browser as before. The rest of the app goes
+   through DATA and does not care which. */
+APP.user = null; APP.prev = null;
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin", cache: "no-store" });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 401 && d.code === "auth") { APP.user = null; showAuth("signin"); throw new Error("Please sign in."); }
+  if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
+  return d;
+}
+const DATA = {
+  list: [],
+  server: () => !!(APP.cfg.db && APP.user),
+  async refresh() { if (!DATA.server()) return []; DATA.list = (await api("GET", "/api/workspaces")).workspaces || []; return DATA.list; },
+  ws: (slug) => DATA.list.find((w) => w.slug === slug) || null,
+  company(slug) {
+    if (DATA.server()) { const w = DATA.ws(slug); return w && w.setup?.profile ? { slug, ...w.setup, schedule: w.schedule, samples: w.samples } : null; }
+    return store.get("companies", {})[slug] || null;
+  },
+  companies() {
+    if (DATA.server()) return DATA.list.map((w) => ({ slug: w.slug, profile: w.setup?.profile || { name: w.name, site: w.site }, savedAt: Date.parse(w.updatedAt) || 0, ws: w }));
+    return Object.values(store.get("companies", {})).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  },
+  async saveCompany(c) {
+    const cos = store.get("companies", {}); cos[c.slug] = c; store.set("companies", cos);
+    if (!DATA.server()) return;
+    const { slug, savedAt, schedule, samples, ...setup } = c;
+    const d = await api("PUT", "/api/workspaces/" + encodeURIComponent(slug), { name: c.profile.name, site: c.profile.site, setup });
+    const i = DATA.list.findIndex((w) => w.slug === slug); const w = { ...(DATA.list[i] || {}), ...d.workspace };
+    if (i >= 0) DATA.list[i] = w; else DATA.list.unshift(w);
+    if (samples && samples !== w.samples) await DATA.patch(slug, { samples });
+  },
+  async patch(slug, body) {
+    const d = await api("PATCH", "/api/workspaces/" + encodeURIComponent(slug), body);
+    const i = DATA.list.findIndex((w) => w.slug === slug); if (i >= 0) DATA.list[i] = { ...DATA.list[i], ...d.workspace };
+    return d.workspace;
+  },
+  // The brand's latest run (and the one before it, for "since last check" deltas).
+  async open(slug) {
+    if (DATA.server()) { const d = await api("GET", `/api/workspaces/${encodeURIComponent(slug)}/runs/latest`); APP.prev = d.prev || null; return d.run || null; }
+    APP.prev = store.get("prev:" + slug, null);
+    return store.get("mission:" + slug, null);
+  },
+  _t: 0, _busy: false, _again: false,
+  // Live runs are saved to the server as they go (debounced), so another device, or a scheduled check, sees them.
+  pushRun(M, now) {
+    if (!DATA.server() || !M?.id) return;
+    clearTimeout(DATA._t);
+    const go = async () => {
+      if (DATA._busy) { DATA._again = true; return; }
+      DATA._busy = true;
+      try { await api("PUT", "/api/runs/" + encodeURIComponent(M.id), { slug: M.slug, data: slim(M) }); }
+      catch (e) { console.warn("[sync]", e.message); }
+      DATA._busy = false; if (DATA._again) { DATA._again = false; DATA._t = setTimeout(go, 1500); }
+    };
+    if (now || M.finishedAt) go(); else DATA._t = setTimeout(go, 4000);
+  },
+};
+const trendOf = (slug) => (DATA.ws(slug)?.trend || []).map((t) => ({ at: Date.parse(t.started_at), source: t.source, ...t.summary })).filter((t) => t.n);
+
+/* ---------- sign in / sign up ---------- */
+let AUTH = { mode: "signup", after: null };
+function showAuth(mode = "signup", after) {
+  AUTH.mode = mode; if (after !== undefined) AUTH.after = after;
+  screen("auth"); paintAuth(); setTimeout(() => $(AUTH.mode === "signup" ? "#authName" : "#authEmail")?.focus(), 30);
+}
+function paintAuth() {
+  const up = AUTH.mode === "signup";
+  $("#authTitle").textContent = up ? "Create your White Petal account" : "Sign in to White Petal";
+  $("#authSub").textContent = AUTH.after?.url ? `Then we'll start on ${host(AUTH.after.url)}.` : up ? "Track how AI search talks about your brand, every week." : "Welcome back.";
+  $$("#authForm [data-only]").forEach((el) => (el.hidden = !up || (el.dataset.only === "invite" && !APP.cfg.invite)));
+  $("#authGo").textContent = up ? "Create account" : "Sign in";
+  $("#authPass").autocomplete = up ? "new-password" : "current-password";
+  $("#authSwitchTxt").textContent = up ? "Already have an account?" : "New to White Petal?";
+  $("#authSwitch").textContent = up ? "Sign in" : "Create an account";
+  $("#authErr").textContent = "";
+}
+$("#authSwitch").addEventListener("click", () => { AUTH.mode = AUTH.mode === "signup" ? "signin" : "signup"; paintAuth(); });
+$("#authForm").addEventListener("submit", async (e) => {
+  e.preventDefault(); const up = AUTH.mode === "signup", btn = $("#authGo");
+  btn.setAttribute("aria-disabled", "true"); $("#authErr").textContent = "";
+  try {
+    const d = await api("POST", up ? "/api/auth/signup" : "/api/auth/login", { email: $("#authEmail").value, password: $("#authPass").value, name: $("#authName").value, code: $("#authCode").value });
+    APP.user = d.user; $("#authPass").value = "";
+    await DATA.refresh();
+    const after = AUTH.after; AUTH.after = null;
+    if (after?.url) return startOnboarding(after.url);
+    return home();
+  } catch (err) { $("#authErr").textContent = err.message; }
+  finally { btn.removeAttribute("aria-disabled"); }
+});
+$("#lpAuth").addEventListener("click", () => showAuth("signin", null));
+$("#signOut").addEventListener("click", async () => { try { await api("POST", "/api/auth/logout"); } catch {} APP.user = null; DATA.list = []; APP.M = null; goHome(); });
+
+// Signed in: straight to the most recently used brand. Otherwise the landing page.
+async function home() {
+  if (DATA.server()) {
+    const first = DATA.companies()[0];
+    if (first) { const ok = await openBrand(first.slug, { quiet: true }); if (ok) return; }
+  }
+  goHome();
+}
+async function openBrand(slug, { quiet } = {}) {
+  let run = null;
+  try { run = await DATA.open(slug); } catch (e) { if (!quiet) toast(esc(e.message)); return false; }
+  if (run?.finishedAt && !run.abandoned) { APP.M = run; DASH.page = "overview"; showReport(); return true; }
+  if (run && run.profile && run.done && !run.finishedAt) { APP.M = run; resumeMission(run); return true; }
+  const c = DATA.company(slug); if (c) { startOnboarding(c.profile.site, c); return true; }
+  return false;
+}
+
+/* ---------- landing: signed out it explains; signed in it is your brand list ---------- */
+const sparkline = (vals, w = 96, h = 26) => {
+  const v = vals.filter((x) => x != null); if (v.length < 2) return "";
+  const max = Math.max(0.05, ...v), min = Math.min(...v, 0), step = w / (v.length - 1);
+  const pts = v.map((x, i) => `${(i * step).toFixed(1)},${(h - 2 - ((x - min) / (max - min || 1)) * (h - 4)).toFixed(1)}`).join(" ");
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+};
+function paintLanding() {
+  const signedIn = DATA.server();
+  $("#lpAuth").hidden = !APP.cfg.auth || signedIn;
+  $("#lpUser").innerHTML = signedIn ? `<span class="muted">${esc(APP.user.email)}</span> <button type="button" class="lnk" id="lpOut">Sign out</button>` : "";
+  $("#lpOut")?.addEventListener("click", () => $("#signOut").click());
+  $("#signOut").hidden = !signedIn; if (signedIn) $("#whoami").textContent = `Sign out (${APP.user.email})`;
+  const avail = (APP.cfg.engines || []).map((e) => ENG[e]).filter(Boolean);
+  $("#lpEngines").innerHTML = avail.length ? `<span class="muted">Checks</span> ${avail.map((n) => `<span class="eng-pill">${esc(n)}</span>`).join("")}` : "";
+  const list = signedIn ? DATA.companies() : [];
+  $("#lpBrands").hidden = !list.length;
+  $("#lpKicker").textContent = signedIn ? (list.length ? "Your brands" : "Add your first brand") : "AI search visibility";
+  $("#lpTitle").innerHTML = signedIn && list.length ? "Add another brand" : "Will AI <em>recommend you?</em>";
+  $("#lpSub").hidden = signedIn && list.length > 0;
+  $$(".howto").forEach((h) => (h.hidden = signedIn && list.length > 0));
+  if (!list.length) return;
+  $("#lpBrands").innerHTML = list.map((c) => {
+    const w = c.ws || {}, t = (w.trend || []).slice().reverse(), last = t[t.length - 1]?.summary;
+    return `<button type="button" class="bcard" data-brand="${esc(c.slug)}">${favImg(host(c.profile.site))}<span class="bc-main"><b>${esc(c.profile.name)}</b><span class="muted">${esc(host(c.profile.site || ""))}</span></span>
+      <span class="bc-num"><b>${last ? last.score : "–"}</b><span class="muted">score</span></span><span class="bc-num"><b>${last ? pct(last.visibility, 0) : "–"}</b><span class="muted">visibility</span></span>
+      <span class="bc-spark">${sparkline(t.map((x) => x.summary?.visibility))}</span>
+      <span class="bc-sched ${w.schedule && w.schedule !== "off" ? "on" : ""}">${w.schedule && w.schedule !== "off" ? `${w.schedule === "daily" ? "Daily" : "Weekly"} checks` : "Manual"}</span></button>`;
+  }).join("");
+}
+$("#lpBrands").addEventListener("click", (e) => { const b = e.target.closest("[data-brand]"); if (b) openBrand(b.dataset.brand); });
+
 /* =================================================================== LANDING */
 function stars() {
-  const c = $("#stars"), x = c.getContext("2d"); let w, h, pts;
+  const c = $("#stars"); if (!c) return; const x = c.getContext("2d"); let w, h, pts;
   const init = () => { w = c.width = innerWidth * devicePixelRatio; h = c.height = $("#landing").offsetHeight * devicePixelRatio; c.style.height = $("#landing").offsetHeight + "px";
     pts = Array.from({ length: Math.min(90, Math.round(innerWidth / 14)) }, () => ({ x: Math.random() * w, y: Math.random() * h, vx: (Math.random() - .5) * .25, vy: (Math.random() - .5) * .25, o: Math.random() < .12 })); };
   init(); addEventListener("resize", init);
@@ -87,6 +235,8 @@ function unfinished() {
   return out.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
 }
 function renderRecent() {
+  paintLanding();
+  if (DATA.server()) { $("#recent").innerHTML = ""; return; }
   const cos = store.get("companies", {});
   const list = Object.values(cos).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)).slice(0, 6);
   const open = unfinished()[0];
@@ -107,6 +257,7 @@ async function recentClick(e) {
   const s = e.target.dataset.slug, r = e.target.dataset.resume, x = e.target.dataset.discard;
   if (x) { const m = store.get("mission:" + x, null); if (m) { m.finishedAt = m.finishedAt || Date.now(); m.abandoned = true; store.set("mission:" + x, m); } return renderRecent(); }
   const slug = s || r; if (!slug) return;
+  if (DATA.server()) return openBrand(slug);
   if (!e.target.dataset.takeover && (await lockedElsewhere(slug))) {
     $("#startErr").innerHTML = `This brand looks busy in another tab. <button type="button" class="linkbtn" style="color:var(--petal);text-decoration:underline" data-takeover="1" data-${r ? "resume" : "slug"}="${esc(slug)}">Continue here instead</button>`;
     return;
@@ -122,6 +273,7 @@ $("#startForm").addEventListener("submit", (e) => {
   const url = $("#startUrl").value.trim();
   if (!url) return $("#startUrl").focus();
   if (APP.cfg.access) { APP.code = $("#accessCode").value.trim() || APP.code; store.set("code", APP.code); if (!APP.code) { $("#startErr").textContent = "Enter the access code first."; return; } }
+  if (APP.cfg.auth && !APP.user) return showAuth("signup", { url });
   if (!APP.cfg.engines.length) { $("#startErr").textContent = "No AI engine is configured on the server. Add GEMINI_API_KEY (free) to the environment variables."; return; }
   startOnboarding(url);
 });
@@ -319,7 +471,13 @@ function renderMatrixNow(el, M, big) {
   let h = `<div></div>` + engs.map((e) => `<div class="eh">${ENG[e]}</div>`).join("");
   for (const q of M.questions) {
     h += `<div class="qh" title="${esc(q.text)}" data-q="${esc(q.id)}">${esc(q.text)}</div>`;
-    for (const e of engs) { const a = M.answers[q.id + "|" + e]; const cls = !a ? "" : a.status === "run" ? "run" : a.status === "err" ? "err" : a.named ? "yes" : "no"; h += `<div class="cell ${cls}" data-cell="${esc(q.id + "|" + e)}">${a && a.status !== "run" && a.status !== "err" ? (a.named ? (a.rank ? "#" + a.rank : "✓") : "–") : ""}</div>`; }
+    for (const e of engs) {
+      const all = answersOf(M, q.id, e), fin = all.filter((a) => (a.status === "yes" || a.status === "no") && !a.absent), named = fin.filter((a) => a.named);
+      const ranks = named.map((a) => a.rank).filter(Boolean), first = fin[0] || all[0];
+      const cls = !all.length ? "" : all.some((a) => a.status === "run") ? "run" : !fin.length ? (all.some((a) => a.absent) ? "na" : "err") : named.length ? "yes" : "no";
+      const label = cls === "na" ? "n/a" : !fin.length ? "" : named.length ? (ranks.length ? "#" + Math.min(...ranks) : "✓") + (fin.length > 1 ? ` ${named.length}/${fin.length}` : "") : fin.length > 1 ? `0/${fin.length}` : "–";
+      h += `<div class="cell ${cls}" ${first ? `data-cell="${esc(akey(first.qid, first.engine, first.sample || 0))}"` : ""} title="${cls === "na" ? "Google showed no AI answer for this query" : ""}">${label}</div>`;
+    }
   }
   el.innerHTML = h;
 }
@@ -339,7 +497,7 @@ function newMission(profile, audit, siteText) {
 let saveT = 0;
 function save(now) {
   if (!APP.M || APP.frozen === APP.M.slug) return;
-  const run = () => { saveT = 0; APP.M.savedAt = Date.now(); store.set("mission:" + APP.M.slug, slim(APP.M)); if (APP.running) lockTouch(APP.M.slug); };
+  const run = () => { saveT = 0; APP.M.savedAt = Date.now(); store.set("mission:" + APP.M.slug, slim(APP.M)); if (APP.running) lockTouch(APP.M.slug); DATA.pushRun(APP.M, now); };
   if (now) { clearTimeout(saveT); return run(); }
   if (!saveT) saveT = setTimeout(run, 1500);
 }
@@ -379,7 +537,7 @@ setInterval(() => { if (APP.running && APP.M) lockTouch(APP.M.slug); }, 8000);
 
 function missionUI(title) {
   screen("mission");
-  $("#feed").innerHTML = ""; setupHud(); gInit(); setRing(null); $("#toReport").hidden = true; $("#stopBtn").hidden = false;
+  $("#feed").innerHTML = ""; setupHud(); gInit(); setRing(null); $("#toReport").hidden = false; $("#toReport").textContent = "Overview"; $("#stopBtn").hidden = false;
   $("#liveTag").className = "live"; $("#liveTag").innerHTML = "<i></i>Live"; $("#matrix").innerHTML = "";
   APP.ctl?.abort(); APP.ctl = new AbortController(); APP.running = true; APP.resuming = false; APP.frozen = null; stick = true;
   $("#hudBrand").textContent = title;
@@ -395,10 +553,13 @@ async function resumeMission(M) {
   bump("q", M.questions.length); bump("a", fin.length); bump("s", fin.reduce((s, a) => s + Math.max(a.nS || 0, (a.searches || []).length), 0)); bump("src", fin.reduce((s, a) => s + Math.max(a.nSrc || 0, (a.sources || []).length), 0)); bump("p", Object.keys(M.inspections || {}).length); bump("r", Object.keys(rivalCounts(M)).length); bump("d", Object.keys(M.pitches || {}).length + (M.assets ? 1 : 0));
   PHASES.forEach(([k]) => { if (M.done[{ site: "questions", questions: "questions", ask: "ask", sources: "sources", think: "insights", draft: "draft" }[k]] || k === "site") finishPhase(k); });
   thought(`<b>Picking up where I left off.</b> ${M.questions.length} questions and ${ans.filter((a) => a.status === "yes" || a.status === "no").length} answers are already saved. Nothing gets asked twice.`, "Runs are saved after every step, so leaving the page doesn't lose work.");
+  showRunning();
   try { await runPipeline(M, sig); } catch (err) { missionError(err, sig); }
 }
 
 function missionError(err, sig) {
+  APP.lastError = sig.aborted ? "" : String(err?.message || "");
+  if (!$("#ready").hidden && $("#ready").dataset.mode === "run") setTimeout(renderRunning, 50);
   APP.running = false; if (APP.M) lockRelease(APP.M.slug);
   if (APP.resuming) return; // the page came back from the background; resume handles the UI
   const M = APP.M;
@@ -449,16 +610,17 @@ async function runPipeline(M, sig) {
     // ---------- 3. ask AI live
     const engs = M.engines;
     const isDone = (a) => a && (a.status === "yes" || a.status === "no");
-    const jobs = []; for (const q of M.questions) for (const e of engs) if (!isDone(M.answers[q.id + "|" + e])) jobs.push([q, e]);
+    const S = Math.max(1, M.samples || 1);
+    const jobs = []; for (let s = 0; s < S; s++) for (const q of M.questions) for (const e of engs) if (!isDone(M.answers[akey(q.id, e, s)])) jobs.push([q, e, s]);
     if (!M.done.ask && jobs.length) {
     phase("ask", 2, `Asking ${engs.map((e) => ENG[e]).join(", ")} live`);
-    thought(`<b>Asking ${engs.map((e) => ENG[e]).join(", ")} all ${M.questions.length} questions, live, with web search on.</b> ${jobs.length} conversations, 2 at a time. Watch who gets named and which pages they lean on.`, "This is exactly what your buyers see. Every page an engine cites is a lever we can pull.");
+    thought(`<b>Asking ${engs.map((e) => ENG[e]).join(", ")} all ${M.questions.length} questions, live, with web search on${S > 1 ? `, ${S} times each so one lucky answer can't skew the numbers` : ""}.</b> ${jobs.length} conversations, 2 at a time. Watch who gets named and which pages they lean on.`, "This is exactly what your buyers see. Every page an engine cites is a lever we can pull.");
     let done = 0; let firstYou = countNamed(M) === 0;
-    const runOne = async ([q, e]) => {
+    const runOne = async ([q, e, s = 0]) => {
       if (sig.aborted) return;
-      const key = q.id + "|" + e; const a = (M.answers[key] = { qid: q.id, engine: e, status: "run", answer: "", sources: [], brands: [], searches: [] });
+      const key = akey(q.id, e, s); const a = (M.answers[key] = { qid: q.id, engine: e, sample: s, status: "run", answer: "", sources: [], brands: [], searches: [] });
       renderMatrix($("#matrix"), M);
-      const card = add(`<div class="hd"><span class="eng"><i style="background:${ENGC[e]}"></i>${ENG[e]}</span><span class="sp"></span><span class="vd">${verdictHtml(a)}</span></div><div class="q">${esc(q.text)}</div><div class="status st">Connecting</div><div class="chips sq"></div><div class="answer typing"></div><div class="sr"></div>`, "card hot");
+      const card = add(`<div class="hd"><span class="eng"><i style="background:${ENGC[e]}"></i>${ENG[e]}</span>${S > 1 ? `<span class="chip">answer ${s + 1} of ${S}</span>` : ""}<span class="sp"></span><span class="vd">${verdictHtml(a)}</span></div><div class="q">${esc(q.text)}</div><div class="status st">Connecting</div><div class="chips sq"></div><div class="answer typing"></div><div class="sr"></div>`, "card hot");
       const ansEl = card.querySelector(".answer"); let raf = 0;
       const paint = () => { raf = 0; ansEl.innerHTML = highlight(a.answer, M); ansEl.classList.toggle("short", a.answer.length < 400); scrollFeed(); };
       for (let attempt = 1; attempt <= 3; attempt++) {
@@ -476,6 +638,7 @@ async function runPipeline(M, sig) {
           delta: (d) => { a.answer += d.text; if (!raf) raf = later(paint); },
           final: (d) => {
             a.answer = d.answer || a.answer; a.sources = d.sources?.length ? d.sources : a.sources; a.brands = d.brands || []; a.model = d.model;
+            if (d.present === false) a.absent = true; // Google showed no AI answer for this query: not a miss, excluded from metrics
             const idx = a.brands.findIndex((b) => isYou(b, M));
             a.named = idx >= 0 || textHasYou(a.answer, M); a.rank = idx >= 0 ? idx + 1 : null; a.status = a.named ? "yes" : "no";
           },
@@ -500,9 +663,9 @@ async function runPipeline(M, sig) {
           if (isYou(b, M)) { gLink("q:" + q.id, "you", "named", "#FF7A1A"); continue; }
           const rid = "r:" + norm(b); const rn = gNode(rid, "rival", b); rn.weight = (rn.weight || 0) + 1; gLink("q:" + q.id, rid, "named", ({ chatgpt: "#45D19A", perplexity: "#5FA8FF", gemini: "#C9A2FF", groq: "#F5F5F3" })[e] || "#8A8A8E");
           const rc = rivalCounts(M)[b] || 0; if (rc === 1) bump("r");
-          if (rc === 4) toast(`<b>${esc(b)}</b> has now been named 4 times. I'll check which pages carry it.`);
+          if (rc === 4 && !$("#mission").hidden) toast(`<b>${esc(b)}</b> has now been named 4 times. I'll check which pages carry it.`);
         }
-        if (a.named && firstYou) { firstYou = false; toast(`${ENG[e]} named <b>${esc(profile.name)}</b>${a.rank ? " at #" + a.rank : ""} for “${esc(q.text)}”.`); }
+        if (a.named && firstYou) { firstYou = false; if (!$("#mission").hidden) toast(`${ENG[e]} named <b>${esc(profile.name)}</b>${a.rank ? " at #" + a.rank : ""} for “${esc(q.text)}”.`); }
         const v = liveScore(M); setRing(v);
       }
       renderMatrix($("#matrix"), M); save();
@@ -516,6 +679,21 @@ async function runPipeline(M, sig) {
     if (!answered.length) throw new Error("None of the AI engines answered. Check your API key and quota, then resume.");
     const top = Object.entries(rivalCounts(M)).sort((a, b) => b[1] - a[1]);
     thought(`<b>${countNamed(M)} of ${answered.length} answers named you.</b> ${top[0] ? `${esc(top[0][0])} was named ${top[0][1]} times${top[1] ? `, ${esc(top[1][0])} ${top[1][1]}` : ""}.` : ""}`);
+
+    // ---------- 3b. sentiment: how positively each answer talks about each brand (0-100, like Peec)
+    if (!M.done.sentiment && !sig.aborted) {
+      phase("think", 4, "Scoring sentiment");
+      const s1 = stepEl("Scoring how positively each answer talks about every brand it names", "Sentiment is one of the core AI-visibility metrics: same mention, very different value if AI warns against you.");
+      const items = answered.filter((a) => (a.brands || []).length || a.named).slice(0, 48).map((a, i) => ({ id: "a" + i, key: a.qid + "|" + a.engine, brands: [...new Set([...(a.brands || []).slice(0, 8), ...(a.named ? [profile.name] : [])])], text: String(a.answer || "").slice(0, 900) }));
+      let raw = "";
+      try {
+        await stream("/api/write", { kind: "sentiment", data: { profile: { name: profile.name }, items: items.map(({ id, brands, text }) => ({ id, brands, text })) } }, { delta: (d) => { raw += d.text; } }, sig);
+        const j = parseLoose(raw); let n = 0;
+        items.forEach((it) => { const sc = j && j[it.id]; if (sc && typeof sc === "object") { M.answers[it.key].sent = sc; n++; } });
+        s1.done(`Sentiment scored in ${n} answers`, n > 0);
+      } catch (e) { if (sig.aborted) throw new DOMException("stopped", "AbortError"); s1.done("Couldn't score sentiment this time", false); }
+      if (!sig.aborted) M.done.sentiment = true; save(true);
+    }
 
     // ---------- 4. follow the sources
     const cites = {};
@@ -552,6 +730,12 @@ async function runPipeline(M, sig) {
     } else finishPhase("sources");
     if (sig.aborted) throw new DOMException("stopped", "AbortError");
     M.done.sources = true; save(true);
+    if (!M.entity && !sig.aborted) {
+      const st = stepEl("Checking whether AI's knowledge sources know who you are (Wikidata, Google Knowledge Graph)", "Models lean on knowledge graphs to decide what a brand is. If you're missing or inconsistent there, AI guesses.");
+      try { M.entity = await post("/api/entity", { name: profile.name, site: profile.site, orgSchema: M.audit?.org ?? null }, sig); st.done(`Entity score ${M.entity.score}/100 · ${(M.entity.checks || []).filter((c) => c.pass === false).length} things to fix`); }
+      catch (e) { st.done("Couldn't check knowledge graphs this time", false); }
+      save();
+    }
 
     // ---------- 5. what AI says about you + insights
     phase("think", 10, "Checking what AI says about you");
@@ -615,11 +799,12 @@ async function runPipeline(M, sig) {
     const fin = add(`<div class="hd"><span class="chip ok">Mission complete</span></div><div class="q">${C.a} answers read, ${C.p} pages opened, ${C.d} drafts written. That's about ${(mins / 60).toFixed(1)} hours of manual work.</div><div><button class="btn" type="button" id="goResults">See your results →</button></div>`, "card hot");
     fin.querySelector("#goResults").onclick = showReady;
     // Like Peec's reveal: if you're watching the end of the feed, move on to the first results by itself.
-    setTimeout(() => { if (!$("#mission").hidden && APP.M === M && stick && !document.hidden) showReady(); }, 2600);
+    if (!$("#ready").hidden) showReady();
+    else setTimeout(() => { if (!$("#mission").hidden && APP.M === M && stick && !document.hidden) showReady(); }, 2600);
 }
 
 $("#stopBtn").addEventListener("click", () => APP.ctl?.abort());
-$("#toReport").addEventListener("click", showReport);
+$("#toReport").addEventListener("click", () => (APP.M?.finishedAt ? showReady() : showRunning()));
 $$(".mobile-tabs button").forEach((b) => b.addEventListener("click", () => { $("#stage").dataset.view = b.dataset.view; $$(".mobile-tabs button").forEach((x) => x.setAttribute("aria-pressed", String(x === b))); if (b.dataset.view === "map") G.sim?.alpha(0.5).restart(); }));
 
 function parseLoose(t) {
@@ -664,9 +849,9 @@ function rebuildMap(M) {
   });
   Object.entries(M.inspections).forEach(([u, r]) => { const sid = sidOf(u); gNode(sid, "source", host(r.final || u), { url: u, inspected: true, you: !!r.you, rivals: (r.rivals || []).length }); if (r.you) gLink(sid, "you", "on", "#FF7A1A"); (r.rivals || []).forEach((rv) => gLink(sid, "r:" + norm(rv), "on", "#E2483D")); });
 }
-$("#rerun").addEventListener("click", async () => { const M = APP.M; if (!M) return; if (await lockedElsewhere(M.slug)) return toast("This brand is running in another tab right now."); startOnboarding(M.profile.site, store.get("companies", {})[M.slug] || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines }); });
+$("#rerun").addEventListener("click", async () => { const M = APP.M; if (!M) return; if (await lockedElsewhere(M.slug)) return toast("This brand is running in another tab right now."); startOnboarding(M.profile.site, DATA.company(M.slug) || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines, samples: M.samples }); });
 $("#newBrand").addEventListener("click", goHome);
-function goHome() { APP.ctl?.abort(); APP.running = false; OB = null; document.body.classList.remove("sheet-open"); if (APP.M) lockRelease(APP.M.slug); toggleAgent(false); screen("landing"); $("#startUrl").value = ""; renderRecent(); }
+function goHome() { APP.ctl?.abort(); APP.running = false; OB = null; document.body.classList.remove("sheet-open"); if (APP.M) lockRelease(APP.M.slug); toggleAgent(false); screen("landing"); $("#startUrl").value = ""; paintLanding(); renderRecent(); if (DATA.server()) DATA.refresh().then(paintLanding).catch(() => {}); }
 
 /* ---------- action deck ---------- */
 let DECK = [], DI = 0;
@@ -678,7 +863,7 @@ function buildDeck() {
   if (!a.orgSchema && as.org_schema) out.push({ id: "org", kind: "5-minute fix", title: "Tell AI exactly who you are", why: "Your homepage has no Organization schema, so AI has to guess your name, URL and description.", code: '<script type="application/ld+json">\n' + JSON.stringify(as.org_schema, null, 2) + "\n</" + "script>", label: "Paste into your homepage <head>" });
   (M.perception?.claims || []).filter((c) => ["wrong", "outdated"].includes(c.verdict)).forEach((c, i) => out.push({ id: "claim" + i, kind: "Correct AI", title: `AI says: “${c.claim}”`, why: c.fix || "Publish a clear correction on your site." }));
   pitchTargets(M).slice(0, 8).forEach((t) => out.push({ id: "pitch:" + t.url, kind: "Get listed", title: `Get named on ${t.domain}`, why: `AI cited this page ${t.n}×${(t.rivals || []).length ? `. ${t.rivals.slice(0, 3).join(", ")} ${t.rivals.length > 1 ? "are" : "is"} already on it` : ""}.`, t }));
-  const missing = M.questions.filter((q) => M.engines.every((e) => !M.answers[q.id + "|" + e]?.named));
+  const missing = M.questions.filter((q) => M.engines.every((e) => !answersOf(M, q.id, e).some((a) => a.named)));
   missing.slice(0, 2).forEach((q) => out.push({ id: "article:" + q.id, kind: "Publish a page", title: `Win “${q.text}”`, why: "No engine named you for this. A page built to answer it gives AI something to cite.", q }));
   const weak = (a.pages || [])[0]; if (weak && weak.score < 60) out.push({ id: "fix:" + weak.url, kind: "Improve a page", title: `Make “${weak.title || host(weak.url)}” quotable`, why: `Scores ${weak.score}/100. Missing: ${(weak.fails || []).slice(0, 3).join(", ")}.`, page: weak });
   DECK = out.filter((x) => !M.deck[x.id]); DI = 0; drawDeck();
@@ -711,7 +896,7 @@ document.addEventListener("click", async (e) => {
     b.setAttribute("aria-disabled", "true"); b.innerHTML = `<svg class="pq think" viewBox="0 0 56 30" style="height:12px;width:22px"><rect x="0" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/><rect x="20" width="16" height="30" rx="4.5" fill="#111114"/><rect x="40" width="16" height="30" rx="4.5" fill="currentColor" opacity=".55"/></svg> Writing`;
     const out = $("#dkText"); out.classList.remove("muted"); out.classList.add("typing"); let t = "";
     const req = c.t ? { kind: "pitch", data: { profile: M.profile, t: { url: c.t.final || c.t.url, title: c.t.title, author: c.t.contacts?.author, rivals: c.t.rivals, questions: (c.t.qs || []).map((q) => qText(M, q)), excerpt: c.t.excerpt } } }
-      : c.q ? { kind: "article", data: { profile: M.profile, question: c.q.text, rivals: [...new Set(M.engines.flatMap((e) => M.answers[c.q.id + "|" + e]?.brands || []))].filter((x) => !isYou(x, M)), siteText: M.siteText } }
+      : c.q ? { kind: "article", data: { profile: M.profile, question: c.q.text, rivals: [...new Set(M.engines.flatMap((e) => answersOf(M, c.q.id, e).flatMap((a) => a.brands || [])))].filter((x) => !isYou(x, M)), siteText: M.siteText } }
       : { kind: "fixpack", data: { profile: M.profile, page: c.page, text: M.siteText } };
     const paintK = throttled(() => { if (c.page) out.innerHTML = md(t); else out.textContent = t; out.scrollTop = out.scrollHeight; });
     try { await stream("/api/write", req, { delta: (d) => { t += d.text; paintK(); } }); }
@@ -755,10 +940,10 @@ async function ask(q) {
 }
 
 /* =================================================================== SCREENS */
-const SCREENS = ["landing", "mission", "onboard", "ready", "reportWrap"];
+const SCREENS = ["landing", "auth", "mission", "onboard", "ready", "reportWrap"];
 function screen(id) {
   SCREENS.forEach((s) => ($("#" + s).hidden = s !== id));
-  document.body.classList.toggle("is-light", ["onboard", "ready", "reportWrap"].includes(id));
+  document.body.classList.add("is-light"); // every screen is light now; the agent console included
   $$(".modal,.drawer").forEach((x) => x.remove());
   scrollTo({ top: 0 });
 }
@@ -788,6 +973,8 @@ const ICONS = {
   research: '<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',
   compare: '<path d="M8 4v16M16 4v16M4 8h8M12 16h8"/>',
   action: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  out: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/>',
 };
 const icon = (k, s = 16) => `<svg class="ic" viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k] || ""}</svg>`;
 function paintIcons(root = document) { $$("i[data-ic]", root).forEach((el) => { el.outerHTML = icon(el.dataset.ic); }); }
@@ -804,8 +991,8 @@ document.addEventListener("error", (e) => { const t = e.target; if (t?.matches?.
    scan → brand profile → market → competitors → topics → focus → prompts → review → run. */
 const INTENTS = { informational: ["Informational", "var(--i-info)"], commercial: ["Commercial", "var(--i-comm)"], transactional: ["Transactional", "var(--i-trans)"] };
 const FOCUS = { research: ["Research", "More emphasis on exploring problems and solutions.", [50, 30, 20]], compare: ["Compare options", "More emphasis on comparisons and recommendations.", [25, 50, 25]], action: ["Take action", "More emphasis on buying, booking, or signing up.", [25, 25, 50]] };
-const ENG_KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY", groq: "GROQ_API_KEY" };
-const ENG_ALL = ["chatgpt", "perplexity", "gemini", "groq"];
+const ENG_KEY = { chatgpt: "OPENAI_API_KEY", perplexity: "PERPLEXITY_API_KEY", gemini: "GEMINI_API_KEY", groq: "GROQ_API_KEY", aio: "DATAFORSEO_LOGIN", aimode: "DATAFORSEO_LOGIN" };
+const ENG_ALL = ["chatgpt", "perplexity", "gemini", "groq", "aio", "aimode"];
 const MARKETS = ["Global", "United States", "United Kingdom", "India", "Europe", "Australia"];
 const OB_BACK = { scan: "home", profile: "home", market: "profile", rivals: "market", topicsGen: "rivals", topics: "rivals", focus: "topics", promptsGen: "focus", promptsReady: "focus", review: "promptsReady" };
 let OB = null;
@@ -813,7 +1000,7 @@ const splitList = (s) => String(s || "").split(/,|;|\/|\band\b/).map((x) => x.tr
 
 async function startOnboarding(url, saved) {
   APP.ctl?.abort(); APP.ctl = new AbortController(); const sig = APP.ctl.signal; APP.running = false;
-  OB = { url, saved, step: "scan", scan: null, checks: [], pages: [], profile: null, rivals: [], topics: [], focus: "action", perTopic: 3, questions: [], selTopic: null, engines: APP.cfg.engines.slice(), gen: false, err: "" };
+  OB = { url, saved, step: "scan", scan: null, checks: [], pages: [], profile: null, rivals: [], topics: [], focus: "action", perTopic: 3, samples: Math.max(1, Math.min(3, saved?.samples || 1)), questions: [], selTopic: null, engines: APP.cfg.engines.filter((e) => e !== "aimode"), gen: false, err: "" };
   screen("onboard"); $("#obSite").textContent = host(url); obRender();
   try {
     let result = null;
@@ -833,7 +1020,7 @@ async function startOnboarding(url, saved) {
     if (saved?.questions?.length) {
       OB.questions = saved.questions.map((q) => ({ topic: q.topic || "General", intent: q.intent, persona: q.persona || "", text: q.text, on: q.on !== false }));
       OB.topics = (saved.topics?.length ? saved.topics : [...new Set(OB.questions.map((q) => q.topic))]).map((t) => (typeof t === "string" ? { name: t } : t));
-      OB.focus = saved.focus || OB.focus; OB.perTopic = saved.perTopic || OB.perTopic;
+      OB.focus = saved.focus || OB.focus; OB.perTopic = saved.perTopic || OB.perTopic; OB.samples = saved.samples || OB.samples;
       const e = (saved.engines || []).filter((x) => APP.cfg.engines.includes(x)); if (e.length) OB.engines = e;
       OB.step = "promptsReady";
     } else { OB.step = "profile"; OB.sheet = "profile"; }
@@ -964,10 +1151,12 @@ function sheetFocus() {
     <div class="dleg"><span><i style="background:var(--i-info)"></i>Informational <b>${d[0]}%</b></span><span><i style="background:var(--i-comm)"></i>Commercial <b>${d[1]}%</b></span><span><i style="background:var(--i-trans)"></i>Transactional <b>${d[2]}%</b></span></div>
     <div class="fsec"><b>Prompts per topic</b><span>${OB.topics.length} topics</span></div>
     <div class="seg">${[2, 3, 4, 5].map((k) => `<button type="button" data-per="${k}" aria-pressed="${OB.perTopic === k}">${k}</button>`).join("")}</div>
+    <div class="fsec"><b>Answers per prompt</b><span>AI answers vary run to run. Asking more than once averages the luck out (more cost)</span></div>
+    <div class="seg">${[1, 2, 3].map((k) => `<button type="button" data-samples="${k}" aria-pressed="${OB.samples === k}">${k}×</button>`).join("")}</div>
     <div class="fsec"><b>AI engines</b><span>Where the prompts run, live with web search</span></div>
     <div class="engs">${ENG_ALL.map((e) => { const av = APP.cfg.engines.includes(e), on = OB.engines.includes(e); return `<label class="engc${av ? "" : " na"}${on ? " on" : ""}"><input type="checkbox" data-eng="${e}" ${on ? "checked" : ""} ${av ? "" : "disabled"}><span class="edot" style="background:${ENGC[e]}"></span><b>${ENG[e]}</b>${av ? "" : `<span class="muted">Add ${ENG_KEY[e]}</span>`}</label>`; }).join("")}</div>
     </div>`,
-    foot: `<span class="muted">About ${n} prompts × ${OB.engines.length} engine${OB.engines.length === 1 ? "" : "s"}</span><span class="sp"></span><button class="btn" type="button" data-act="genPrompts" ${n && OB.engines.length ? "" : 'aria-disabled="true"'}>Generate prompts</button>`,
+    foot: `<span class="muted">About ${n} prompts × ${OB.engines.length} engine${OB.engines.length === 1 ? "" : "s"}${OB.samples > 1 ? ` × ${OB.samples}` : ""} = ${n * OB.engines.length * OB.samples} answers per check</span><span class="sp"></span><button class="btn" type="button" data-act="genPrompts" ${n && OB.engines.length ? "" : 'aria-disabled="true"'}>Generate prompts</button>`,
   };
 }
 function sheetReview() {
@@ -976,7 +1165,7 @@ function sheetReview() {
   const pers = [...new Set([...(OB.profile.personas || []), ...qs.map((q) => q.persona).filter(Boolean)])];
   const ic = Object.keys(INTENTS).map((k) => on.filter((q) => q.intent === k).length);
   const tot = Math.max(1, ic.reduce((a, b) => a + b, 0));
-  const jobs = on.length * OB.engines.length;
+  const jobs = on.length * OB.engines.length * OB.samples;
   return {
     body: `<h2 id="obSheetTitle">Review your prompt set</h2><p class="sub">Review the prompts generated for your topics. Uncheck any that should not run.</p>
     <div class="rv-grid">
@@ -1073,7 +1262,7 @@ $("#onboard").addEventListener("submit", (e) => {
   inp.value = ""; obRender(); setTimeout(() => (document.getElementById(inp.id) || e.target.querySelector("input"))?.focus(), 0);
 });
 $("#onboard").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-go],[data-act],[data-rm],[data-rvx],[data-tpx],[data-market],[data-focus],[data-per],[data-seltopic],[data-rvtopic]");
+  const b = e.target.closest("[data-go],[data-act],[data-rm],[data-rvx],[data-tpx],[data-market],[data-focus],[data-per],[data-samples],[data-seltopic],[data-rvtopic]");
   if (!b || b.getAttribute("aria-disabled") === "true") return;
   const d = b.dataset;
   if (d.rm) { const [k, i] = d.rm.split(":"); OB.profile[k].splice(+i, 1); return obRender(); }
@@ -1082,6 +1271,7 @@ $("#onboard").addEventListener("click", (e) => {
   if (d.market) { OB.profile.market = d.market; return obGo("rivals"); }
   if (d.focus) { OB.focus = d.focus; return obRender(); }
   if (d.per) { OB.perTopic = +d.per; return obRender(); }
+  if (d.samples) { OB.samples = +d.samples; return obRender(); }
   if (d.seltopic != null) { OB.selTopic = d.seltopic; return obRender(); }
   if (d.rvtopic != null) { OB.reviewTopic = d.rvtopic; return obRender(); }
   if (d.go) return obGo(d.go);
@@ -1105,19 +1295,20 @@ async function obLaunch() {
   const slug = slugify(profile.name);
   if (await lockedElsewhere(slug)) return toast("This brand is running in another tab right now.");
   OB.sheet = null; document.body.classList.remove("sheet-open");
-  const cos = store.get("companies", {});
-  cos[slug] = { slug, profile, audit: r.audit, siteText: r.siteText, topics: OB.topics.map((t) => t.name), focus: OB.focus, perTopic: OB.perTopic,
+  const company = { slug, profile, audit: r.audit, siteText: r.siteText, topics: OB.topics.map((t) => t.name), focus: OB.focus, perTopic: OB.perTopic, samples: OB.samples,
     questions: OB.questions.map(({ topic, intent, persona, text, on }) => ({ topic, intent, persona, text, on })), engines: OB.engines.slice(), savedAt: Date.now() };
-  store.set("companies", cos);
-  const prev = store.get("mission:" + slug, null); if (prev?.finishedAt) store.set("prev:" + slug, prev);
+  try { await DATA.saveCompany(company); } catch (e) { return toast(esc(e.message)); }
+  const prev = APP.M?.slug === slug && APP.M.finishedAt ? APP.M : store.get("mission:" + slug, null);
+  if (prev?.finishedAt) { store.set("prev:" + slug, prev); APP.prev = prev; }
   APP.M = newMission(profile, r.audit, r.siteText); const M = APP.M;
   M.engines = ENG_ALL.filter((e) => OB.engines.includes(e) && APP.cfg.engines.includes(e));
   M.questions = qs.map((q, i) => ({ id: "q" + (i + 1), intent: q.intent, topic: q.topic, persona: q.persona, text: q.text }));
-  M.done.questions = true; save(true);
+  M.samples = OB.samples; M.done.questions = true; save(true);
   const sig = missionUI(profile.name);
   rebuildMap(M); bump("q", M.questions.length); finishPhase("site"); finishPhase("questions"); renderMatrix($("#matrix"), M);
   thought(`<b>Setup approved for ${esc(profile.name)}.</b> ${M.questions.length} prompts across ${OB.topics.length} topics, ${profile.competitors.length} competitors, ${M.engines.map((e) => ENG[e]).join(", ")}. Saved to your companies.`, "Everything below runs on the profile, rivals and prompts you just approved.");
   add(`<div class="hd"><span>Tracked prompts</span><span class="sp"></span><span class="mono" style="font-size:.7rem">${M.questions.length}</span></div><div class="ql">${M.questions.map((q) => `<div><span>${esc(q.intent)}</span>${esc(q.text)}</div>`).join("")}</div>`, "card");
+  showRunning();
   try { await runPipeline(M, sig); } catch (err) { missionError(err, sig); }
 }
 
@@ -1125,11 +1316,11 @@ async function obLaunch() {
    Sidebar workspace, filter chips, KPI strip, visibility chart, brand ranking, sources by domain and type,
    chats with a details panel, gap analysis, and the action deck. All numbers come from this run's answers. */
 const DASH = { page: "overview", eng: "all", chatFilter: "all", domFilter: "all" };
-const PAGES = { overview: ["Home", "Overview"], site: ["Home", "My website"], insights: ["Brand", "Insights"], perception: ["Brand", "Perception"], prompts: ["Prompts", "All prompts"], domains: ["Sources", "Domains"], gap: ["Sources", "Gap analysis"], actions: ["Optimize", "Actions"], ranking: ["Results", "Ranking"], chats: ["Results", "Chats"] };
+const PAGES = { overview: ["Home", "Overview"], site: ["Home", "My website"], insights: ["Brand", "Insights"], perception: ["Brand", "Perception"], prompts: ["Prompts", "All prompts"], domains: ["Sources", "Domains"], gap: ["Sources", "Gap analysis"], actions: ["Optimize", "Actions"], ranking: ["Results", "Ranking"], chats: ["Results", "Chats"], fanouts: ["Results", "Fanouts"] };
 const BAR = ["#7AC231", "#9A1AF0", "#1F5FF5", "#1B35B0", "#14B8A6", "#E11D74", "#64748B", "#A16207"];
 const TYPEC = { You: "var(--petal)", Competitor: "#E2483D", UGC: "#3B82F6", Reviews: "#8B5CF6", Reference: "#14B8A6", Other: "#9A9AA0" };
 const pct = (v, d = 1) => (v == null ? "–" : (100 * v).toFixed(d).replace(/\.0$/, "") + "%");
-const finished = (a) => a && (a.status === "yes" || a.status === "no");
+const finished = (a) => a && (a.status === "yes" || a.status === "no") && !a.absent; // an AI Overview Google did not show is not a miss
 
 function domainType(d, M) {
   const own = host(M.profile.site || "");
@@ -1146,27 +1337,43 @@ function metrics(M, eng = "all") {
   if (!M) return null;
   const A = Object.values(M.answers || {}).filter((a) => finished(a) && (eng === "all" || a.engine === eng));
   const B = new Map(), YOU = "\u0000you";
-  const get = (name) => { const you = isYou(name, M), k = you ? YOU : norm(name); if (!k) return null; if (!B.has(k)) B.set(k, { name: you ? M.profile.name : String(name).trim(), you, mentions: 0, pos: [], tracked: false, qids: new Set() }); return B.get(k); };
+  const keyOf = (name) => (isYou(name, M) ? YOU : norm(name));
+  const get = (name) => { const you = isYou(name, M), k = you ? YOU : norm(name); if (!k) return null; if (!B.has(k)) B.set(k, { name: you ? M.profile.name : String(name).trim(), you, mentions: 0, pos: [], sent: [], tracked: false, qids: new Set() }); return B.get(k); };
   get(M.profile.name); (M.profile.competitors || []).forEach((n) => { const r = get(n); if (r && !r.you) r.tracked = true; });
   let total = 0;
   for (const a of A) {
     const seen = new Set();
-    (a.brands || []).forEach((b, i) => { const r = get(b); if (!r) return; const k = r.you ? YOU : norm(b); if (seen.has(k)) return; seen.add(k); r.mentions++; r.pos.push(i + 1); r.qids.add(a.qid); total++; });
-    if (a.named && !seen.has(YOU)) { const r = B.get(YOU); r.mentions++; if (a.rank) r.pos.push(a.rank); r.qids.add(a.qid); total++; }
+    (a.brands || []).forEach((b, i) => { const r = get(b); if (!r) return; const k = keyOf(b); if (seen.has(k)) return; seen.add(k); r.mentions++; r.pos.push(i + 1); r.qids.add(a.qid); total++; });
+    if (a.named && !seen.has(YOU)) { const r = B.get(YOU); r.mentions++; if (a.rank) r.pos.push(a.rank); r.qids.add(a.qid); total++; seen.add(YOU); }
+    // sentiment: one 0-100 score per brand per answer, scored by the agent after the answers come in
+    const done = new Set();
+    for (const [n, v] of Object.entries(a.sent || {})) { const k = keyOf(n); if (done.has(k) || !seen.has(k) || typeof v !== "number") continue; done.add(k); B.get(k)?.sent.push(Math.max(0, Math.min(100, v))); }
   }
-  const brands = [...B.values()].map((r) => ({ ...r, vis: A.length ? r.mentions / A.length : 0, sov: total ? r.mentions / total : 0, position: r.pos.length ? r.pos.reduce((s, x) => s + x, 0) / r.pos.length : null }))
+  const avg = (x) => (x.length ? x.reduce((s, v) => s + v, 0) / x.length : null);
+  const brands = [...B.values()].map((r) => ({ ...r, vis: A.length ? r.mentions / A.length : 0, sov: total ? r.mentions / total : 0, position: avg(r.pos), sentiment: avg(r.sent), win: A.length ? r.pos.filter((p) => p === 1).length / A.length : 0 }))
     .filter((r) => r.mentions || r.you || r.tracked).sort((a, b) => b.vis - a.vis || (a.position ?? 99) - (b.position ?? 99) || (a.you ? 1 : 0) - (b.you ? 1 : 0));
   const you = brands.find((b) => b.you), rank = brands.indexOf(you) + 1;
   const byEngine = M.engines.map((e) => { const x = Object.values(M.answers || {}).filter((a) => a.engine === e && finished(a)); return { e, n: x.length, vis: x.length ? x.filter((a) => a.named).length / x.length : null }; }).filter((x) => x.n);
-  const D = new Map();
-  for (const a of A) { const seen = new Set(); for (const s of a.sources || []) { const d = host(s.url); if (!d) continue; const r = D.get(d) || { d, retr: 0, chats: 0, cited: 0, urls: new Set() }; r.retr++; r.urls.add(s.url); if (s.cited) r.cited++; if (!seen.has(d)) { r.chats++; seen.add(d); } D.set(d, r); } }
+  const D = new Map(); let ownAns = 0;
+  for (const a of A) {
+    const seen = new Set(); let own = false;
+    for (const s of a.sources || []) { const d = host(s.url); if (!d) continue; const r = D.get(d) || { d, retr: 0, chats: 0, cited: 0, urls: new Set() }; r.retr++; r.urls.add(s.url); if (s.cited) r.cited++; if (!seen.has(d)) { r.chats++; seen.add(d); } D.set(d, r); if (domainType(d, M) === "You") own = true; }
+    if (own) ownAns++;
+  }
   const insp = Object.values(M.inspections || {});
-  const domains = [...D.values()].map((r) => { const pages = insp.filter((p) => host(p.url) === r.d && p.ok); return { ...r, nUrls: r.urls.size, type: domainType(r.d, M), youOn: pages.length ? pages.some((p) => p.you) : null, rivalsOn: [...new Set(pages.flatMap((p) => p.rivals || []))] }; }).sort((a, b) => b.retr - a.retr);
+  const totalRetr = [...D.values()].reduce((s, d) => s + d.retr, 0);
+  const domains = [...D.values()].map((r) => { const pages = insp.filter((p) => host(p.url) === r.d && p.ok); return { ...r, nUrls: r.urls.size, share: totalRetr ? r.retr / totalRetr : 0, type: domainType(r.d, M), youOn: pages.length ? pages.some((p) => p.you) : null, rivalsOn: [...new Set(pages.flatMap((p) => p.rivals || []))] }; }).sort((a, b) => b.retr - a.retr);
   const types = {}; domains.forEach((d) => (types[d.type] = (types[d.type] || 0) + d.retr));
   const opened = insp.filter((p) => p.ok);
-  return { A, n: A.length, brands, you, rank, total, byEngine, domains, types, totalRetr: domains.reduce((s, d) => s + d.retr, 0), onPages: opened.filter((p) => p.you).length, opened: opened.length, gaps: pitchTargets(M) };
+  const claims = (M.perception?.claims || []).filter((c) => ["accurate", "wrong", "outdated"].includes(c.verdict));
+  const leaderSov = Math.max(you?.sov || 0, ...brands.filter((b) => !b.you).map((b) => b.sov), 0);
+  const score = visibilityScore({ vis: you?.vis || 0, sov: you?.sov || 0, leaderSov, position: you?.position, sentiment: you?.sentiment });
+  return { A, n: A.length, brands, you, rank, total, byEngine, domains, types, totalRetr, onPages: opened.filter((p) => p.you).length, opened: opened.length, gaps: pitchTargets(M), score,
+    usedAsSource: A.length ? ownAns / A.length : null, citationShare: totalRetr ? (types.You || 0) / totalRetr : null,
+    accuracy: claims.length ? claims.filter((c) => c.verdict === "accurate").length / claims.length : null, claims: claims.length };
 }
-function prevMetrics(M, eng) { const p = store.get("prev:" + M.slug, null); return p && p.answers ? { at: p.startedAt, m: metrics(p, eng) } : null; }
+function metricsFor(M, pred) { const sub = { ...M, answers: Object.fromEntries(Object.entries(M.answers || {}).filter(([, a]) => pred(a) && (DASH.eng === "all" || a.engine === DASH.eng))) }; return metrics(sub, "all"); }
+function prevMetrics(M, eng) { const p = APP.prev?.slug === M.slug && APP.prev.id !== M.id ? APP.prev : store.get("prev:" + M.slug, null); return p && p.answers ? { at: p.startedAt, m: metrics(p, eng) } : null; }
 function delta(cur, prev, { inv = false, unit = "pts", scale = 100 } = {}) {
   if (cur == null || prev == null) return "";
   const d = (cur - prev) * scale; if (Math.abs(d) < 0.05) return `<span class="dl">±0</span>`;
@@ -1176,22 +1383,51 @@ function delta(cur, prev, { inv = false, unit = "pts", scale = 100 } = {}) {
 const brandAv = (b, M) => (b.you ? favImg(host(M.profile.site)) : letterAv(b.name));
 
 /* ---- building blocks shared by the dashboard and the "ready" preview */
+// Same formula as server/metrics.mjs visibilityScore: 50% visibility, 20% share of voice vs the leader,
+// 20% position (#1 full, #6+ none), 10% sentiment. One number to watch, like Surfer's Visibility Score.
+function visibilityScore({ vis = 0, sov = 0, leaderSov = 0, position = null, sentiment = null }) {
+  const posF = position ? Math.max(0, Math.min(1, (6 - position) / 5)) : 0, sovRel = leaderSov ? Math.min(1, sov / leaderSov) : 0, sent = sentiment == null ? 0.5 : sentiment / 100;
+  return Math.round(100 * (0.5 * vis + 0.2 * sovRel + 0.2 * posF + 0.1 * (vis ? sent : 0)));
+}
+const sentC = (v) => (v == null ? "var(--dim)" : v >= 65 ? "var(--good)" : v >= 45 ? "var(--warn)" : "var(--bad)");
+const sentHtml = (v) => (v == null ? '<span class="muted">–</span>' : `<span class="sent"><i style="background:${sentC(v)}"></i>${Math.round(v)}</span>`);
+// The metric set the AI-visibility tools report (Peec, Profound, Otterly), with how each one is measured here.
+const METRICS = [
+  ["Visibility score", "One 0–100 number for how strongly AI recommends you.", "50% visibility + 20% share of voice vs the leader + 20% position (#1 full, #6+ none) + 10% sentiment", "Surfer Visibility Score (similar idea)"],
+  ["Visibility", "Share of AI answers that mention your brand.", "Answers naming you ÷ all answers", "Peec Visibility · Profound Visibility Score · Otterly Brand Coverage"],
+  ["Share of voice", "Your mentions as a share of every brand mention.", "Your mentions ÷ all brand mentions", "Peec, Profound and Otterly Share of Voice"],
+  ["Position", "Your average rank in the answers that mention you. Lower is better.", "Average of your rank (1 = named first)", "Peec Position · Profound Average Position · Otterly Avg. Brand Position"],
+  ["Sentiment", "How positively AI talks about you, 0–100. Most brands land between 65 and 85.", "Agent scores the wording about each brand in each answer, averaged", "Peec Sentiment · Profound Sentiment Score · Otterly Brand Sentiment"],
+  ["Win rate", "Share of answers where you're named first, ahead of every other brand.", "Answers ranking you #1 ÷ all answers", "Peec Win rate"],
+  ["Used as source", "Share of answers that cite a page on your own domain.", "Answers citing your domain ÷ all answers", "Peec Used as source · Otterly Domain Coverage"],
+  ["Citation share", "Your domain's share of every citation AI used.", "Citations of your domain ÷ all citations", "Profound Citation Share"],
+  ["Accuracy", "Share of checkable claims AI makes about you that are correct.", "Accurate claims ÷ (accurate + wrong + outdated)", "Profound Accuracy Score"],
+  ["On cited pages", "Of the pages AI cited that the agent opened, how many mention you.", "Pages naming you ÷ pages opened", "White Petal"],
+];
+function howModal() {
+  modal(`<span class="status">Methodology</span><h3>How these numbers are measured</h3><p class="muted">Every number comes from this run's live answers: each prompt asked on each engine with web search on, your name left out of the prompt.</p>
+    <table class="tbl"><thead><tr><th>Metric</th><th>What it means</th><th>Formula</th><th>Same as</th></tr></thead><tbody>${METRICS.map(([n, d, f, s]) => `<tr><td><b>${n}</b></td><td>${d}</td><td class="muted">${f}</td><td class="muted sm">${s}</td></tr>`).join("")}</tbody></table>`);
+  $(".modal:last-of-type .box").style.maxWidth = "980px";
+}
 function kpiHtml(M, m, pm) {
-  const y = m.you || {}, py = pm?.m?.you;
+  const y = m.you || {}, py = pm?.m?.you, tip = (n) => esc((METRICS.find((x) => x[0] === n) || [])[1] || "");
   const eng = m.byEngine.filter((x) => x.vis != null).sort((a, b) => b.vis - a.vis);
-  const cell = (label, tip, val, dl = "") => `<div class="kpi"><span class="kl">${label} <span title="${esc(tip)}">${icon("info", 12)}</span></span><span class="kv">${val}${dl}</span></div>`;
-  return `<div class="kpis">
-    ${cell("Visibility", "Share of AI answers that mention you.", pct(y.vis), delta(y.vis, py?.vis))}
-    ${cell("Share of voice", "Your mentions as a share of all brand mentions.", pct(y.sov), delta(y.sov, py?.sov))}
-    ${cell("Position", "Your average rank when AI mentions you. Lower is better.", y.position ? "#" + y.position.toFixed(1) : "–", delta(y.position, py?.position, { inv: true, unit: "", scale: 1 }))}
-    ${cell("On cited pages", "Of the pages AI cited that we opened, how many mention you.", `${m.onPages}<small>/${m.opened}</small>`)}
-    ${eng.length > 1 ? cell("Strongest engine", "Engine that mentions you most.", `<span class="kengine"><i style="background:${ENGC[eng[0].e]}"></i>${ENG[eng[0].e]}</span>`) + cell("Weakest engine", "Engine that mentions you least.", `<span class="kengine"><i style="background:${ENGC[eng[eng.length - 1].e]}"></i>${ENG[eng[eng.length - 1].e]}</span>`)
-      : cell("Answers", "Live AI answers in this view.", m.n) + cell("Sources", "Distinct domains AI retrieved.", m.domains.length)}
+  const cell = (label, val, dl = "") => `<div class="kpi"><span class="kl">${label} <span title="${tip(label)}">${icon("info", 12)}</span></span><span class="kv">${val}${dl}</span></div>`;
+  const engCell = (label, x) => `<div class="kpi"><span class="kl">${label}</span><span class="kv"><span class="kengine"><i style="background:${ENGC[x.e]}"></i>${ENG[x.e]}</span><small>${pct(x.vis, 0)}</small></span></div>`;
+  return `<div class="kpis k8">
+    ${cell("Visibility score", `${m.score}<small>/100</small>`, delta(m.score, pm?.m?.score, { unit: "", scale: 1 }))}
+    ${cell("Visibility", pct(y.vis), delta(y.vis, py?.vis))}
+    ${cell("Share of voice", pct(y.sov), delta(y.sov, py?.sov))}
+    ${cell("Position", y.position ? "#" + y.position.toFixed(1) : "–", delta(y.position, py?.position, { inv: true, unit: "", scale: 1 }))}
+    ${cell("Sentiment", y.sentiment != null ? `${sentHtml(y.sentiment)}` : "–", delta(y.sentiment, py?.sentiment, { unit: "", scale: 1 }))}
+    ${cell("Win rate", pct(y.win), delta(y.win, py?.win))}
+    ${cell("Used as source", pct(m.usedAsSource), delta(m.usedAsSource, pm?.m?.usedAsSource))}
+    ${eng.length > 1 ? engCell("Strongest engine", eng[0]) : cell("Citation share", pct(m.citationShare))}
   </div>`;
 }
 function visChartHtml(M, m) {
   const top = m.brands.slice(0, 5); if (m.you && !top.includes(m.you)) top.push(m.you);
-  const max = Math.max(0.05, ...top.map((b) => b.vis)); const ceil = Math.min(1, Math.ceil((max * 100) / 5) * 5 / 100) || 0.05;
+  const max = Math.max(0.01, ...top.map((b) => b.vis)); const ceil = Math.min(1, Math.max(0.2, Math.ceil((max * 100) / 20) * 20 / 100));
   const ticks = [1, 0.75, 0.5, 0.25, 0].map((t) => t * ceil);
   let ci = 0;
   return `<div class="card"><div class="card-h"><b>Visibility</b><span title="Share of AI answers that mention each brand.">${icon("info", 13)}</span></div>
@@ -1201,8 +1437,8 @@ function visChartHtml(M, m) {
 function brandsTableHtml(M, m, limit = 5, title = "Top 5 brands") {
   const rows = m.brands.slice(0, limit); if (m.you && !rows.includes(m.you)) rows.push(m.you);
   return `<div class="card"><div class="card-h"><b>${title}</b><span title="Ranked by visibility across this view's answers.">${icon("info", 13)}</span>${limit < m.brands.length ? `<span class="sp"></span><button class="lnk" type="button" data-page="ranking">Show all</button>` : ""}</div>
-    <table class="tbl"><thead><tr><th>#</th><th>Brand</th><th class="r">Visibility</th><th class="r">SoV</th><th class="r">Position</th></tr></thead><tbody>
-    ${rows.map((b) => `<tr class="${b.you ? "you" : ""}"><td class="muted">${m.brands.indexOf(b) + 1}</td><td><span class="bcell">${brandAv(b, M)}<b>${esc(b.name)}</b>${b.you ? '<span class="youtag">You</span>' : ""}</span></td><td class="r">${pct(b.vis)}</td><td class="r">${pct(b.sov)}</td><td class="r">${b.position ? b.position.toFixed(1) : '<span class="sk" style="width:28px"></span>'}</td></tr>`).join("")}
+    <table class="tbl"><thead><tr><th>#</th><th>Brand</th><th class="r">Visibility</th><th class="r">SoV</th><th class="r">Sentiment</th><th class="r">Position</th></tr></thead><tbody>
+    ${rows.map((b) => `<tr class="${b.you ? "you" : ""}"><td class="muted">${m.brands.indexOf(b) + 1}</td><td><span class="bcell">${brandAv(b, M)}<b>${esc(b.name)}</b>${b.you ? '<span class="youtag">You</span>' : ""}</span></td><td class="r">${pct(b.vis)}</td><td class="r">${pct(b.sov)}</td><td class="r">${sentHtml(b.sentiment)}</td><td class="r">${b.position ? b.position.toFixed(1) : '<span class="sk" style="width:28px"></span>'}</td></tr>`).join("")}
     </tbody></table></div>`;
 }
 function topDomainsHtml(M, m, limit = 6) {
@@ -1231,9 +1467,50 @@ function previewApp(M) {
     <div class="fr-chips pad">${[70, 52, 96, 84].map((w) => `<span class="fr-chip"><span class="sk sq sm"></span><span class="sk" style="width:${w}px"></span></span>`).join("")}<span class="sp"></span><span class="muted" style="font-size:.78rem">Preview result</span></div>
     <div class="fr-scroll"><div class="grid2">${visChartHtml(M, m)}${brandsTableHtml(M, m)}</div>${chatCardsHtml(M, m)}${topDomainsHtml(M, m)}</div></div></div>`;
 }
+/* ---- RUNNING: like Peec, the analysis happens under a live preview of the workspace.
+   The answers fill the charts as they arrive; the full agent console is one click away. */
+let RUNT = 0, RUNSIG = "";
+const RUN_STEPS = [["ask", "Ask AI live"], ["sentiment", "Score sentiment"], ["sources", "Open cited pages"], ["perception", "Fact-check"], ["insights", "Work out why"], ["draft", "Draft fixes"]];
+function showRunning() {
+  if (!APP.M) return;
+  if (APP.M.finishedAt) return showReady();
+  screen("ready"); $("#ready").dataset.mode = "run"; RUNSIG = ""; $("#readyPreview").classList.remove("calm");
+  renderRunning();
+  clearInterval(RUNT); RUNT = setInterval(() => { if ($("#ready").hidden || $("#ready").dataset.mode !== "run") { clearInterval(RUNT); return; } renderRunning(); }, 1500);
+}
+function renderRunning() {
+  const M = APP.M; if (!M) return;
+  if (M.finishedAt) return showReady();
+  const jobs = M.questions.length * M.engines.length * (M.samples || 1), got = Object.values(M.answers || {}).filter((a) => a.status && a.status !== "run").length;
+  const cur = RUN_STEPS.find(([k]) => !M.done[k]), stopped = !APP.running;
+  const p = Math.round(100 * (Math.min(1, got / Math.max(1, jobs)) * 0.55 + RUN_STEPS.slice(1).filter(([k]) => M.done[k]).length * 0.09));
+  $("#readyTitle").innerHTML = stopped ? "The analysis is paused" : `Analysing ${esc(M.profile.name)}<span class="dots"></span>`;
+  $("#readySub").textContent = stopped ? APP.lastError || "Everything so far is saved. Pick up where it stopped, or look at the results so far."
+    : !M.done.ask ? `Asking ${M.engines.map((e) => ENG[e]).join(", ")} your ${M.questions.length} prompts live, with web search on. ${got} of ${jobs} answers in. The preview fills in as they arrive.`
+    : `${$("#hudPhase").textContent || "Working"}. ${got} answers in, ${Object.keys(M.inspections || {}).length} cited pages opened.`;
+  $("#readyRun").innerHTML = `<div class="ob-prog wide"><i style="width:${Math.max(3, p)}%"></i></div>
+    <div class="runsteps">${RUN_STEPS.map(([k, l]) => `<span class="${M.done[k] ? "ok" : cur && cur[0] === k && !stopped ? "on" : ""}">${M.done[k] ? icon("check", 12) : cur && cur[0] === k && !stopped ? '<i class="spin"></i>' : ""}${l}</span>`).join("")}</div>
+    <div class="ob-btns">${stopped ? `<button class="btn ghost" type="button" data-run="results">See results so far</button><button class="btn" type="button" data-run="resume">Resume</button>` : `<button class="btn ghost" type="button" data-run="watch">${icon("play", 15)}Watch the agent live</button><button class="btn ghost" type="button" data-run="stop">Stop</button>`}</div>`;
+  $("#readyGo").parentElement.hidden = true;
+  const sig = got + "|" + Object.keys(M.inspections || {}).length + "|" + Object.keys(M.done).filter((k) => M.done[k]).join(",");
+  if (sig !== RUNSIG) {
+    const first = !RUNSIG; RUNSIG = sig;
+    const sc = $("#readyPreview .fr-scroll")?.scrollTop || 0;
+    $("#readyPreview").innerHTML = previewApp(M);
+    const el = $("#readyPreview .fr-scroll"); if (el) el.scrollTop = sc;
+    if (first) setTimeout(() => $("#readyPreview").classList.add("calm"), 900); // animate once, then update quietly
+  }
+}
+$("#readyRun").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-run]"); if (!b) return; const a = b.dataset.run;
+  if (a === "watch") return $("#viewLog").click();
+  if (a === "stop") return APP.ctl?.abort();
+  if (a === "resume") { resumeMission(APP.M); return; }
+  if (a === "results") return showReport("overview");
+});
 function showReady() {
   const M = APP.M; if (!M) return;
-  screen("ready");
+  screen("ready"); $("#ready").dataset.mode = "done"; clearInterval(RUNT); $("#readyRun").innerHTML = ""; $("#readyGo").parentElement.hidden = false; $("#readyPreview").classList.remove("calm");
   const m = metrics(M, "all");
   $("#readyTitle").textContent = `${M.profile.name}'s workspace is ready`;
   $("#readySub").textContent = `Here are your first results: ${m.n} live AI answers, ${m.domains.length} source domains, and ${m.gaps.length} cited pages where rivals are listed and you're not.`;
@@ -1251,22 +1528,25 @@ function showReport(page) {
   $("#projName").textContent = M.profile.name; $("#projAv").innerHTML = favImg(host(M.profile.site));
   buildDeck(); renderSugs(); renderChat();
   dashRender();
+  if (DATA.server()) { loadInts(M.slug); DATA.refresh().then(() => { if (APP.M === M && ["overview", "settings"].includes(DASH.page)) dashRender(); }).catch(() => {}); }
 }
 function filtersHtml(M) {
-  const pm = store.get("prev:" + M.slug, null);
+  const pm = APP.prev?.slug === M.slug && APP.prev.id !== M.id ? APP.prev : store.get("prev:" + M.slug, null);
   return `<div class="segc">${["all", ...M.engines].map((e) => `<button type="button" data-eng="${e}" aria-pressed="${DASH.eng === e}">${e === "all" ? "All engines" : `<i style="background:${ENGC[e]}"></i>${ENG[e]}`}</button>`).join("")}</div>
     <span class="fchip">${icon("rank", 14)}Run · ${new Date(M.startedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
     <span class="fchip">${icon("list", 14)}${M.questions.length} prompts</span>
     ${pm ? `<span class="fchip muted">vs ${new Date(pm.startedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>` : ""}
-    <span class="sp"></span><span class="fchip muted">${esc(M.profile.market || "Global")}</span>`;
+    <span class="sp"></span><button type="button" class="fchip btnchip" data-howto>${icon("info", 14)}How we measure</button><span class="fchip muted">${esc(M.profile.market || "Global")}</span>`;
 }
 function dashRender() {
   const M = APP.M; if (!M || $("#reportWrap").hidden) return;
   const [g, t] = PAGES[DASH.page] || PAGES.overview;
-  $$("#nav [data-page]").forEach((b) => b.classList.toggle("on", b.dataset.page === DASH.page));
+  $$("#side [data-page]").forEach((b) => b.classList.toggle("on", b.dataset.page === DASH.page));
+  const gapsN = M.questions.filter((q) => { const as = M.engines.flatMap((e) => answersOf(M, q.id, e)).filter(finished); return as.length && !as.some((a) => a.named) && as.some((a) => (a.brands || []).some((b) => !isYou(b, M))); }).length;
+  if ($("#navGaps")) $("#navGaps").textContent = gapsN || "";
   $("#crumb").innerHTML = `<span class="muted">${g}</span>${icon("chev", 13)}<b>${t}</b>`;
   $("#filters").innerHTML = filtersHtml(M);
-  $("#filters").hidden = ["actions", "site", "perception"].includes(DASH.page);
+  $("#filters").hidden = ["actions", "site", "perception", "settings"].includes(DASH.page);
   const m = metrics(M, DASH.eng), pm = prevMetrics(M, DASH.eng);
   $("#pages").innerHTML = `<div class="pg">${(PAGE[DASH.page] || PAGE.overview)(M, m, pm)}</div>`;
   if (DASH.page === "actions") drawDeck();
@@ -1280,34 +1560,47 @@ const PAGE = {
     const h = !y?.mentions ? "AI doesn't recommend you yet" : m.rank === 1 ? "You're #1 in AI visibility" : `You're #${m.rank} in AI visibility`;
     const p = !y?.mentions ? `${lead ? `${esc(lead.name)} appears in ${pct(lead.vis)} of answers. ` : ""}You weren't named in any of the ${m.n} answers.` : m.rank === 1 ? `You appear in more AI answers than any competitor, and are often the default choice.` : `${esc(lead.name)} appears in ${pct(lead.vis)} of answers; you appear in ${pct(y.vis)}.`;
     const acts = DECK.slice(0, 3);
-    return head(h, p) + kpiHtml(M, m, pm) + `<div class="grid2">${visChartHtml(M, m)}${brandsTableHtml(M, m)}</div>`
+    return head(h, p) + kpiHtml(M, m, pm) + trendHtml(M) + referralHtml(M) + `<div class="grid2">${visChartHtml(M, m)}${brandsTableHtml(M, m)}</div>`
       + `<div class="grid2"><div class="card"><div class="card-h"><b>Visibility by engine</b></div>${m.byEngine.map((x) => { const top = metrics(M, x.e).brands.find((b) => !b.you); return `<div class="erow"><span class="en">${engDot(x.e)}${ENG[x.e]}</span><span class="eb"><i style="width:${(100 * (x.vis || 0)).toFixed(0)}%"></i></span><b>${pct(x.vis, 0)}</b><span class="muted el">${top ? `Leader: ${esc(top.name)} ${pct(top.vis, 0)}` : ""}</span></div>`; }).join("")}</div>
         <div class="card"><div class="card-h"><b>Top recommended actions</b><span class="sp"></span><button class="lnk" type="button" data-page="actions">${DECK.length} actions ${icon("chev", 12)}</button></div>${acts.length ? acts.map((c) => `<button type="button" class="arow" data-page="actions" data-card="${esc(c.id)}"><span class="ak">${esc(c.kind)}</span><b>${esc(c.title)}</b><span class="muted">${esc(c.why)}</span></button>`).join("") : '<p class="muted pad">Nothing left to do. Run again next week.</p>'}</div></div>`
       + chatCardsHtml(M, m) + topDomainsHtml(M, m);
   },
   ranking(M, m) {
-    return head("Ranking", "Every brand AI mentioned for your prompts, ranked by visibility.") + `<div class="card"><table class="tbl"><thead><tr><th>#</th><th>Brand</th><th class="r">Visibility</th><th class="r">SoV</th><th class="r">Position</th><th class="r">Mentions</th><th>Status</th></tr></thead><tbody>
-      ${m.brands.map((b, i) => `<tr class="${b.you ? "you" : ""}"><td class="muted">${i + 1}</td><td><span class="bcell">${brandAv(b, M)}<b>${esc(b.name)}</b>${b.you ? '<span class="youtag">You</span>' : ""}</span></td><td class="r"><span class="minibar"><i style="width:${(100 * b.vis).toFixed(0)}%"></i></span>${pct(b.vis)}</td><td class="r">${pct(b.sov)}</td><td class="r">${b.position ? b.position.toFixed(1) : "–"}</td><td class="r">${b.mentions}</td><td>${b.you ? "" : b.tracked ? '<span class="tagx">Tracked</span>' : '<span class="tagx dim">Discovered</span>'}</td></tr>`).join("")}</tbody></table></div>`;
+    const pts = m.brands.filter((b) => b.position != null).slice(0, 12), maxV = Math.max(0.1, ...pts.map((b) => b.vis)), maxP = Math.max(3, ...pts.map((b) => b.position));
+    const X = (v) => 48 + (v / maxV) * 450, Y = (p) => 20 + ((p - 1) / (maxP - 1 || 1)) * 200;
+    return head("Ranking", "Every brand AI mentioned for your prompts, ranked by visibility.") + `<div class="grid2 rk">
+      <div class="card"><div class="card-h"><b>Visibility index</b><span title="Further right: named in more answers. Higher up: named earlier in them. Top right is where buyers look first.">${icon("info", 13)}</span></div>
+        <svg class="scatter" viewBox="0 0 600 260" role="img" aria-label="Visibility against average position for each brand">
+          <line x1="48" y1="230" x2="580" y2="230" class="ax"/><line x1="48" y1="14" x2="48" y2="230" class="ax"/>
+          <text x="580" y="250" text-anchor="end" class="axl">Visibility →</text><text x="40" y="22" text-anchor="end" class="axl">#1</text><text x="40" y="226" text-anchor="end" class="axl">#${maxP.toFixed(0)}</text>
+          ${pts.map((b) => `<g transform="translate(${X(b.vis).toFixed(1)},${Y(b.position).toFixed(1)})"><circle r="${b.you ? 8 : 6}" class="${b.you ? "you" : ""}"><title>${esc(b.name)}: ${pct(b.vis)} visibility, position ${b.position.toFixed(1)}</title></circle><text x="11" y="4" class="${b.you ? "you" : ""}">${esc(b.name.slice(0, 18))}</text></g>`).join("")}
+        </svg></div>
+      <div class="card"><div class="card-h"><b>Head to head</b><span class="muted">How often each rival is named first vs you</span></div>
+        ${m.brands.filter((b) => !b.you).slice(0, 7).map((b) => `<div class="erow"><span class="en">${letterAv(b.name)}${esc(b.name)}</span><span class="eb two"><i style="width:${(100 * b.win).toFixed(0)}%;background:#9A9AA0"></i></span><b>${pct(b.win, 0)}</b></div>`).join("")}
+        <div class="erow you"><span class="en">${brandAv(m.you || { you: true, name: M.profile.name }, M)}${esc(M.profile.name)}</span><span class="eb"><i style="width:${(100 * (m.you?.win || 0)).toFixed(0)}%"></i></span><b>${pct(m.you?.win, 0)}</b></div></div></div>
+      <div class="card"><table class="tbl"><thead><tr><th>#</th><th>Brand</th><th class="r">Visibility</th><th class="r">SoV</th><th class="r">Sentiment</th><th class="r">Position</th><th class="r">Win rate</th><th class="r">Mentions</th><th>Status</th></tr></thead><tbody>
+      ${m.brands.map((b, i) => `<tr class="${b.you ? "you" : ""}"><td class="muted">${i + 1}</td><td><span class="bcell">${brandAv(b, M)}<b>${esc(b.name)}</b>${b.you ? '<span class="youtag">You</span>' : ""}</span></td><td class="r"><span class="minibar"><i style="width:${(100 * b.vis).toFixed(0)}%"></i></span>${pct(b.vis)}</td><td class="r">${pct(b.sov)}</td><td class="r">${sentHtml(b.sentiment)}</td><td class="r">${b.position ? b.position.toFixed(1) : "–"}</td><td class="r">${pct(b.win, 0)}</td><td class="r">${b.mentions}</td><td>${b.you ? "" : b.tracked ? '<span class="tagx">Tracked</span>' : '<span class="tagx dim">Discovered</span>'}</td></tr>`).join("")}</tbody></table></div>`;
   },
   prompts(M, m) {
     const groups = {}; M.questions.forEach((q) => (groups[q.topic || TOPIC_OF[q.intent] || "Prompts"] = groups[q.topic || TOPIC_OF[q.intent] || "Prompts"] || []).push(q));
     const engs = DASH.eng === "all" ? M.engines : [DASH.eng];
     return head("All prompts", `${M.questions.length} prompts across ${Object.keys(groups).length} topics. Click one to read the answers.`) + Object.entries(groups).map(([t, qs]) => `<div class="card"><div class="card-h"><b>${esc(t)}</b><span class="muted">${qs.length}</span></div>
       <table class="tbl click"><thead><tr><th>Prompt</th><th>Intent</th><th>${engs.map((e) => engDot(e)).join("")}</th><th class="r">Visibility</th><th class="r">Position</th><th>Top brand</th></tr></thead><tbody>
-      ${qs.map((q) => { const as = engs.map((e) => M.answers[q.id + "|" + e]).filter(finished); const named = as.filter((a) => a.named); const ranks = named.map((a) => a.rank).filter(Boolean); const tb = as.flatMap((a) => (a.brands || []).slice(0, 1)).find((b) => b); const first = as[0];
-        return `<tr ${first ? `data-chat="${esc(first.qid + "|" + first.engine)}"` : ""}><td class="pt">${esc(q.text)}</td><td>${intentTag(q.intent)}</td><td><span class="dots3">${engs.map((e) => { const a = M.answers[q.id + "|" + e]; return `<i class="${!finished(a) ? "" : a.named ? "y" : "n"}" title="${ENG[e]}: ${!finished(a) ? "no answer" : a.named ? "named" : "not named"}"></i>`; }).join("")}</span></td><td class="r">${as.length ? pct(named.length / as.length, 0) : "–"}</td><td class="r">${ranks.length ? "#" + (ranks.reduce((s, x) => s + x, 0) / ranks.length).toFixed(1) : "–"}</td><td>${tb ? `<span class="bcell sm">${isYou(tb, M) ? favImg(host(M.profile.site)) : letterAv(tb)}${esc(tb)}</span>` : "–"}</td></tr>`; }).join("")}
+      ${qs.map((q) => { const as = engs.flatMap((e) => answersOf(M, q.id, e)).filter(finished); const named = as.filter((a) => a.named); const ranks = named.map((a) => a.rank).filter(Boolean); const tb = as.flatMap((a) => (a.brands || []).slice(0, 1)).find((b) => b); const first = as[0];
+        return `<tr ${first ? `data-chat="${esc(first.qid + "|" + first.engine)}"` : ""}><td class="pt">${esc(q.text)}</td><td>${intentTag(q.intent)}</td><td><span class="dots3">${engs.map((e) => { const x = answersOf(M, q.id, e).filter(finished), n = x.filter((a) => a.named).length; return `<i class="${!x.length ? "" : n === x.length ? "y" : n ? "h" : "n"}" title="${ENG[e]}: ${!x.length ? "no answer" : `named in ${n} of ${x.length}`}"></i>`; }).join("")}</span></td><td class="r">${as.length ? pct(named.length / as.length, 0) : "–"}</td><td class="r">${ranks.length ? "#" + (ranks.reduce((s, x) => s + x, 0) / ranks.length).toFixed(1) : "–"}</td><td>${tb ? `<span class="bcell sm">${isYou(tb, M) ? favImg(host(M.profile.site)) : letterAv(tb)}${esc(tb)}</span>` : "–"}</td></tr>`; }).join("")}
       </tbody></table></div>`).join("");
   },
   chats(M, m) {
     const f = DASH.chatFilter, list = m.A.filter((a) => f === "all" || (f === "you" ? a.named : !a.named));
     return head("Chats", "The individual AI answers behind your metrics.") + `<div class="segc inl">${[["all", `All · ${m.n}`], ["you", `Mention you · ${m.A.filter((a) => a.named).length}`], ["not", `Don't mention you · ${m.A.filter((a) => !a.named).length}`]].map(([k, l]) => `<button type="button" data-chatf="${k}" aria-pressed="${f === k}">${l}</button>`).join("")}</div>
-      <div class="card"><table class="tbl click"><thead><tr><th>Prompt</th><th>Engine</th><th class="r">Your position</th><th>Brands mentioned</th><th class="r">Sources</th></tr></thead><tbody>
-      ${list.map((a) => `<tr data-chat="${esc(a.qid + "|" + a.engine)}"><td class="pt">${esc(qText(M, a.qid))}</td><td><span class="bcell sm">${engDot(a.engine)}${ENG[a.engine]}</span></td><td class="r">${a.named ? `<span class="posb">#${a.rank || "–"}</span>` : '<span class="posb no">–</span>'}</td><td><span class="avs">${(a.brands || []).slice(0, 6).map((b) => (isYou(b, M) ? favImg(host(M.profile.site)) : letterAv(b))).join("")}${(a.brands || []).length > 6 ? `<span class="more">+${a.brands.length - 6}</span>` : ""}</span></td><td class="r">${Math.max(a.nSrc || 0, (a.sources || []).length)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No chats in this view.</td></tr>'}
+      <div class="card"><table class="tbl click"><thead><tr><th>Prompt</th><th>Engine</th><th class="r">Your position</th><th class="r">Sentiment</th><th>Brands mentioned</th><th class="r">Sources</th></tr></thead><tbody>
+      ${list.map((a) => `<tr data-chat="${esc(a.qid + "|" + a.engine)}"><td class="pt">${esc(qText(M, a.qid))}</td><td><span class="bcell sm">${engDot(a.engine)}${ENG[a.engine]}</span></td><td class="r">${a.named ? `<span class="posb">#${a.rank || "–"}</span>` : '<span class="posb no">–</span>'}</td><td class="r">${(() => { const k = Object.keys(a.sent || {}).find((n) => isYou(n, M)); return a.named && k ? sentHtml(a.sent[k]) : '<span class="muted">–</span>'; })()}</td><td><span class="avs">${(a.brands || []).slice(0, 6).map((b) => (isYou(b, M) ? favImg(host(M.profile.site)) : letterAv(b))).join("")}${(a.brands || []).length > 6 ? `<span class="more">+${a.brands.length - 6}</span>` : ""}</span></td><td class="r">${Math.max(a.nSrc || 0, (a.sources || []).length)}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">No chats in this view.</td></tr>'}
       </tbody></table></div>`;
   },
   domains(M, m) {
+    if (DASH.srcView === "urls") return urlsPage(M, m);
     const f = DASH.domFilter, list = m.domains.filter((d) => f === "all" || (f === "gap" ? d.youOn === false && d.rivalsOn.length : d.type === f));
-    return head("Domains", "Which sites AI retrieves when it answers your prompts. Get onto the ones it trusts.") + `<div class="segc inl">${[["all", "All"], ["gap", "Rivals on it, you're not"], ...Object.keys(m.types).map((t) => [t, t])].map(([k, l]) => `<button type="button" data-domf="${esc(k)}" aria-pressed="${f === k}">${esc(l)}</button>`).join("")}</div>
+    return head("Domains", "Which sites AI retrieves when it answers your prompts. Get onto the ones it trusts.") + srcSwitch() + `<div class="segc inl">${[["all", "All"], ["gap", "Rivals on it, you're not"], ...Object.keys(m.types).map((t) => [t, t])].map(([k, l]) => `<button type="button" data-domf="${esc(k)}" aria-pressed="${f === k}">${esc(l)}</button>`).join("")}</div>
       <div class="card"><table class="tbl"><thead><tr><th>Domain</th><th>Type</th><th class="r">Retrieved</th><th class="r">Retrievals</th><th class="r">Cited</th><th>You on it</th><th>Rivals on it</th></tr></thead><tbody>
       ${list.map((d) => `<tr><td><span class="bcell">${favImg(d.d)}<b>${esc(d.d)}</b></span></td><td><span class="itag"><i style="background:${TYPEC[d.type]}"></i>${d.type}</span></td><td class="r">${pct(m.n ? d.chats / m.n : 0, 0)}</td><td class="r">${d.retr}</td><td class="r">${d.cited}</td><td>${d.youOn == null ? '<span class="muted">not opened</span>' : d.youOn ? '<span class="pillx ok">Yes</span>' : '<span class="pillx no">No</span>'}</td><td class="muted ell">${esc(d.rivalsOn.slice(0, 3).join(", "))}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">Nothing here.</td></tr>'}
       </tbody></table></div>`;
@@ -1316,8 +1609,30 @@ const PAGE = {
     return head("Gap analysis", `Pages AI cited where rivals are listed and you're not. ${m.gaps.length} open targets. Getting onto these is the fastest way into AI answers.`) + `<div class="card">${m.gaps.length ? m.gaps.map((t) => `<div class="grow2">${favImg(t.domain || host(t.url))}<div class="gm"><a href="${esc(safeUrl(t.final || t.url) || "#")}" target="_blank" rel="noopener"><b>${esc(t.title || t.url)}</b></a><span class="muted">${esc(t.domain || host(t.url))} · cited ${t.n}× · for ${(t.qs || []).length} prompt${(t.qs || []).length === 1 ? "" : "s"}</span><span class="chips">${(t.rivals || []).map((r) => `<span class="tagx red">${esc(r)}</span>`).join("")}${t.contacts?.emails?.[0] ? `<span class="tagx mono">${esc(t.contacts.emails[0])}</span>` : t.contacts?.author ? `<span class="tagx">by ${esc(t.contacts.author)}</span>` : ""}</span></div><button class="btn sm${M.pitches[t.url] ? " ghost" : ""}" type="button" data-pitch="${esc(t.url)}">${M.pitches[t.url] ? "Open pitch" : "Draft pitch"}</button></div>`).join("") : '<p class="muted pad">No gaps found in the pages we opened. Nice.</p>'}</div>`;
   },
   insights(M, m) {
-    return head("Insights", "The agent's read of everything it saw, with the evidence behind it.") + `<div class="card md pad">${M.insights ? md(M.insights) : '<p class="muted">No insights for this run.</p>'}</div>
+    const topics = [...new Set(M.questions.map((q) => q.topic || TOPIC_OF[q.intent] || "Prompts"))];
+    const tm = (t) => { const ids = new Set(M.questions.filter((q) => (q.topic || TOPIC_OF[q.intent] || "Prompts") === t).map((q) => q.id)); return metricsFor(M, (a) => ids.has(a.qid)); };
+    const per = topics.map((t) => [t, tm(t)]);
+    const cols = m.brands.slice(0, 6); if (m.you && !cols.includes(m.you)) cols.splice(5, 1, m.you);
+    const heat = (v) => `background:rgba(242,107,15,${(0.06 + 0.8 * v).toFixed(2)});color:${v > 0.55 ? "#fff" : "var(--ink)"}`;
+    const y = m.you || {}, lead = m.brands.find((b) => !b.you);
+    return head(!y.mentions ? "AI doesn't recommend you yet" : m.rank === 1 ? "You're #1 in AI visibility" : `You're #${m.rank} in AI visibility`, `${lead ? `${esc(lead.name)} leads with ${pct(lead.vis)} visibility. ` : ""}Where you lead and where you lose, by topic and engine.`) + kpiHtml(M, m, prevMetrics(M, DASH.eng))
+      + `<div class="card"><div class="card-h"><b>Performance by topic</b><span class="muted">Your numbers inside each topic</span></div><table class="tbl"><thead><tr><th>Topic</th><th class="r">Prompts</th><th class="r">Visibility</th><th class="r">SoV</th><th class="r">Sentiment</th><th class="r">Position</th><th>Leader</th>${M.engines.map((e) => `<th class="r">${engDot(e)}${ENG[e]}</th>`).join("")}</tr></thead><tbody>
+        ${per.map(([t, x]) => { const yy = x.you || {}, ld = x.brands[0]; return `<tr><td><b>${esc(t)}</b></td><td class="r">${M.questions.filter((q) => (q.topic || TOPIC_OF[q.intent] || "Prompts") === t).length}</td><td class="r">${pct(yy.vis)}</td><td class="r">${pct(yy.sov)}</td><td class="r">${sentHtml(yy.sentiment)}</td><td class="r">${yy.position ? yy.position.toFixed(1) : "–"}</td><td>${ld ? `<span class="bcell sm">${brandAv(ld, M)}${esc(ld.name)} <span class="muted">${pct(ld.vis, 0)}</span></span>` : "–"}</td>${M.engines.map((e) => { const v = x.A.filter((a) => a.engine === e); return `<td class="r">${v.length ? pct(v.filter((a) => a.named).length / v.length, 0) : "–"}</td>`; }).join("")}</tr>`; }).join("")}</tbody></table></div>
+      <div class="card"><div class="card-h"><b>Performance matrix</b><span class="muted">Visibility of each brand in each topic</span></div><div class="hm-wrap"><table class="tbl hm"><thead><tr><th>Topic</th>${cols.map((b) => `<th class="c"><span class="bcell sm">${brandAv(b, M)}${esc(b.name.slice(0, 14))}</span></th>`).join("")}</tr></thead><tbody>
+        ${per.map(([t, x]) => `<tr><td><b>${esc(t)}</b></td>${cols.map((b) => { const r = x.brands.find((z) => (b.you ? z.you : norm(z.name) === norm(b.name))); const v = r ? r.vis : 0; return `<td class="c"><span class="hc${b.you ? " you" : ""}" style="${heat(v)}">${pct(v, 0)}</span></td>`; }).join("")}</tr>`).join("")}</tbody></table></div></div>
+      <div class="card"><div class="card-h"><b>Why this is happening</b><span class="muted">The agent's read, with the evidence behind it</span></div><div class="md pad">${M.insights ? md(M.insights) : '<p class="muted">No insights for this run.</p>'}</div></div>
       <div class="card"><div class="card-h"><b>Question by question</b><span class="muted">Each cell is one live AI answer. Click to read it.</span></div><div class="pad"><div class="matrix" id="matrixBig"></div></div></div>`;
+  },
+  fanouts(M, m) {
+    const Q = new Map();
+    for (const a of m.A) for (const s of a.searches || []) { const k = norm(s); if (!k) continue; const r = Q.get(k) || { q: s, n: 0, engines: new Set(), qids: new Set() }; r.n++; r.engines.add(a.engine); r.qids.add(a.qid); Q.set(k, r); }
+    const list = [...Q.values()].sort((a, b) => b.n - a.n);
+    const words = {}; list.forEach((r) => norm(r.q).split(" ").filter((w) => w.length > 3 && !/^(what|which|with|from|that|this|your|best|for|and|the|2024|2025|2026)$/.test(w)).forEach((w) => (words[w] = (words[w] || 0) + r.n)));
+    const top = Object.entries(words).sort((a, b) => b[1] - a[1]).slice(0, 14);
+    return head("Fanouts", "The web searches AI ran behind the scenes to answer your prompts. These are the queries to rank for.") + `<div class="kpis"><div class="kpi"><span class="kl">Distinct queries</span><span class="kv">${list.length}</span></div><div class="kpi"><span class="kl">Total searches</span><span class="kv">${list.reduce((s, r) => s + r.n, 0)}</span></div><div class="kpi"><span class="kl">Searches per answer</span><span class="kv">${m.n ? (list.reduce((s, r) => s + r.n, 0) / m.n).toFixed(1) : "–"}</span></div></div>
+      ${top.length ? `<div class="card"><div class="card-h"><b>Common terms</b></div><div class="chips pad">${top.map(([w, n]) => `<span class="tagx">${esc(w)} <b>${n}</b></span>`).join("")}</div></div>` : ""}
+      <div class="card"><table class="tbl"><thead><tr><th>Query</th><th>Engines</th><th>Prompt</th><th class="r">Occurrences</th></tr></thead><tbody>
+      ${list.map((r) => `<tr><td><b>${esc(r.q)}</b></td><td>${[...r.engines].map((e) => `<span class="bcell sm">${engDot(e)}${ENG[e]}</span>`).join(" ")}</td><td class="muted ell">${esc(qText(M, [...r.qids][0]))}</td><td class="r">${r.n}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">The engines didn\'t report their searches for this run.</td></tr>'}</tbody></table></div>`;
   },
   perception(M) {
     const P = M.perception;
@@ -1329,7 +1644,7 @@ const PAGE = {
     const a = M.audit || {};
     return head("My website", `How readable ${esc(host(M.profile.site))} is for AI crawlers and answer engines.`) + `<div class="kpis"><div class="kpi"><span class="kl">AI-readiness</span><span class="kv">${a.avg ?? "–"}<small>/100</small></span></div><div class="kpi"><span class="kl">llms.txt</span><span class="kv">${a.llms ? "Found" : "Missing"}</span></div><div class="kpi"><span class="kl">Organization schema</span><span class="kv">${a.orgSchema ? "Yes" : "No"}</span></div><div class="kpi"><span class="kl">FAQ schema</span><span class="kv">${a.faqSchema ? "Yes" : "No"}</span></div><div class="kpi"><span class="kl">Sitemap URLs</span><span class="kv">${a.sitemap ?? "–"}</span></div></div>
       <div class="grid2"><div class="card"><div class="card-h"><b>Crawler access</b><span class="muted">robots.txt</span></div><table class="tbl"><tbody>${Object.entries(a.bots || {}).map(([b, ok]) => `<tr><td><b>${esc(b)}</b></td><td class="r"><span class="pillx ${ok ? "ok" : "no"}">${ok ? "Allowed" : "Blocked"}</span></td></tr>`).join("")}</tbody></table></div>
-      <div class="card"><div class="card-h"><b>Pages</b><span class="muted">AI-readiness score</span></div><table class="tbl"><tbody>${(a.pages || []).map((p) => `<tr><td><span class="score ${p.score >= 60 ? "hi" : p.score >= 35 ? "md" : "lo"}">${p.score}</span></td><td><a href="${esc(safeUrl(p.url) || "#")}" target="_blank" rel="noopener">${esc(p.title || host(p.url))}</a><div class="muted sm">${esc((p.fails || []).slice(0, 3).join(" · ") || "Strong page")}</div></td></tr>`).join("")}</tbody></table></div></div>`;
+      <div class="card"><div class="card-h"><b>Pages</b><span class="muted">AI-readiness score</span></div><table class="tbl pagetbl"><tbody>${(a.pages || []).map((p) => `<tr><td class="sc"><span class="score ${p.score >= 60 ? "hi" : p.score >= 35 ? "md" : "lo"}">${p.score}</span></td><td><a href="${esc(safeUrl(p.url) || "#")}" target="_blank" rel="noopener">${esc(p.title || host(p.url))}</a><div class="muted sm">${esc((p.fails || []).slice(0, 3).join(" · ") || "Strong page")}</div></td></tr>`).join("")}</tbody></table></div></div>`;
   },
   actions(M) {
     return head("Actions", "Ranked fixes with the evidence behind each one. Work through them one at a time.") + `<div class="grid2 act"><div class="card pad"><div class="deckbar" id="deckCount"></div><p class="muted sm"><span class="kbd">→</span> done · <span class="kbd">←</span> skip</p><div class="deck" id="deck"></div></div>
@@ -1360,7 +1675,7 @@ function openChat(key) {
         <div class="cm-scroll"><div class="bubble">${esc(qText(M, a.qid))}</div><div class="cm-ans md">${markHtml(md(a.answer || a.error || ""), M, a.brands)}</div></div>
         <div class="cm-nav"><button type="button" class="lnk" data-cm="-1" ${i ? "" : "disabled"}>${icon("arrow", 14)} Previous</button><span class="muted sm">${i + 1} of ${list.length}</span><button type="button" class="lnk" data-cm="1" ${i < list.length - 1 ? "" : "disabled"}>Next ${icon("arrow", 14)}</button></div></div>
       <aside class="cm-side"><div class="cm-sh"><b>Details</b><span class="sp"></span><button type="button" class="iconbtn" data-cm="x" aria-label="Close">${icon("x", 15)}</button></div>
-        <div class="cm-sec">${icon("rank", 14)}Brands</div>${(a.brands || []).map((b, j) => `<div class="cm-b${isYou(b, M) ? " you" : ""}">${isYou(b, M) ? favImg(host(M.profile.site)) : letterAv(b)}<span>${esc(b)}</span><span class="sp"></span><span class="muted">#${j + 1}</span></div>`).join("") || '<p class="muted sm">No brands named.</p>'}
+        <div class="cm-sec">${icon("rank", 14)}Brands</div>${(a.brands || []).map((b, j) => `<div class="cm-b${isYou(b, M) ? " you" : ""}">${isYou(b, M) ? favImg(host(M.profile.site)) : letterAv(b)}<span>${esc(b)}</span><span class="sp"></span>${a.sent && a.sent[b] != null ? sentHtml(a.sent[b]) : ""}<span class="muted">#${j + 1}</span></div>`).join("") || '<p class="muted sm">No brands named.</p>'}
         ${(a.searches || []).length ? `<div class="cm-sec">${icon("search", 14)}Searches it ran</div>${a.searches.map((s) => `<p class="cm-q">${esc(s)}</p>`).join("")}` : ""}
         <div class="cm-sec">${icon("link", 14)}Sources</div>${(a.sources || []).map((s) => `<a class="cm-s" href="${esc(safeUrl(s.url) || "#")}" target="_blank" rel="noopener">${favImg(host(s.url))}<span><b>${esc(s.title || host(s.url))}</b><span class="muted">${esc(host(s.url))}</span></span></a>`).join("") || '<p class="muted sm">No sources.</p>'}
       </aside></div>`;
@@ -1403,7 +1718,10 @@ $("#reportWrap").addEventListener("click", (e) => {
   const en = t.closest("[data-eng]"); if (en) { DASH.eng = en.dataset.eng; return dashRender(); }
   const cf = t.closest("[data-chatf]"); if (cf) { DASH.chatFilter = cf.dataset.chatf; return dashRender(); }
   const df = t.closest("[data-domf]"); if (df) { DASH.domFilter = df.dataset.domf; return dashRender(); }
+  const sv = t.closest("[data-srcview]"); if (sv) { DASH.srcView = sv.dataset.srcview; return dashRender(); }
+  const ut = t.closest("[data-utype]"); if (ut) { DASH.urlType = ut.dataset.utype; return dashRender(); }
   const pi = t.closest("[data-pitch]"); if (pi) return pitchModal(pi.dataset.pitch);
+  if (t.closest("[data-howto]")) return howModal();
 });
 function focusCard(id) { const i = DECK.findIndex((c) => c.id === id); if (i > 0) DECK.unshift(DECK.splice(i, 1)[0]); }
 $("#agentBtn").addEventListener("click", () => toggleAgent());
@@ -1413,8 +1731,8 @@ $("#sideToggle").addEventListener("click", () => $("#side").classList.toggle("op
 $("#projBtn").addEventListener("click", (e) => {
   e.stopPropagation(); const menu = $("#projMenu"), open = menu.hidden;
   if (open) {
-    const cos = Object.values(store.get("companies", {})).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
-    menu.innerHTML = `<div class="pm-h">Your brands</div>${cos.map((c) => { const m = store.get("mission:" + c.slug, null); return `<button type="button" data-proj="${esc(c.slug)}" class="${APP.M?.slug === c.slug ? "on" : ""}">${favImg(host(c.profile.site))}<span>${esc(c.profile.name)}</span><span class="sp"></span><span class="muted sm">${m?.finishedAt ? new Date(m.finishedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "set up"}</span></button>`; }).join("")}<button type="button" data-proj="__new">${icon("plus", 14)}<span>New brand</span></button>`;
+    const cos = DATA.companies();
+    menu.innerHTML = `<div class="pm-h">Your brands</div>${cos.map((c) => { const at = c.ws ? c.ws.lastRunAt : store.get("mission:" + c.slug, null)?.finishedAt; const sc = c.ws?.trend?.[0]?.summary?.score; return `<button type="button" data-proj="${esc(c.slug)}" class="${APP.M?.slug === c.slug ? "on" : ""}">${favImg(host(c.profile.site))}<span>${esc(c.profile.name)}</span><span class="sp"></span>${sc != null ? `<span class="pm-score">${sc}</span>` : ""}<span class="muted sm">${at ? new Date(at).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : "set up"}</span></button>`; }).join("")}<button type="button" data-proj="__new">${icon("plus", 14)}<span>New brand</span></button>`;
   }
   menu.hidden = !open; $("#projBtn").setAttribute("aria-expanded", String(open));
 });
@@ -1422,9 +1740,284 @@ document.addEventListener("click", (e) => { if (!e.target.closest(".proj-wrap"))
 $("#projMenu").addEventListener("click", (e) => {
   const b = e.target.closest("[data-proj]"); if (!b) return; $("#projMenu").hidden = true;
   if (b.dataset.proj === "__new") return goHome();
-  const m = store.get("mission:" + b.dataset.proj, null);
-  if (m?.finishedAt && !m.abandoned) { APP.M = m; DASH.page = "overview"; return showReport(); }
-  const c = store.get("companies", {})[b.dataset.proj]; if (c) startOnboarding(c.profile.site, c);
+  openBrand(b.dataset.proj);
+});
+
+/* =================================================================== MORE OF THE DASHBOARD
+   Mention gaps, search rankings, cited URLs by page type, brand settings (schedule, sampling, integrations),
+   trends and AI referral traffic. */
+Object.assign(PAGES, { gaps: ["Prompts", "Mention gaps"], rankings: ["Sources", "Search rankings"], settings: ["Brand", "Settings"] });
+APP.ints = {};
+async function loadInts(slug, rerender = true) {
+  if (!DATA.server() || !slug) return null;
+  try { const d = await api("GET", `/api/workspaces/${encodeURIComponent(slug)}/integrations`); APP.ints[slug] = d; if (rerender && APP.M?.slug === slug && !$("#reportWrap").hidden) dashRender(); return d; }
+  catch (e) { console.warn(e.message); return null; }
+}
+const intData = (M, id) => (APP.ints[M.slug]?.integrations || []).find((i) => i.id === id && i.connected && i.status !== "error")?.data || null;
+
+// What kind of page AI cited. Heuristic on URL + title; good enough to show which formats win (listicles,
+// comparisons, reviews...), which is what Peec's URL classification and Surfer's "content types" report show.
+function pageType(url, title = "") {
+  const u = String(url || "").toLowerCase(), t = String(title || "").toLowerCase(), s = u + " " + t;
+  let p = ""; try { p = new URL(url).pathname.toLowerCase(); } catch {}
+  if (/reddit\.com|quora\.com|stackexchange|stackoverflow|community\.|forum|news\.ycombinator|discord/.test(u)) return "Forum / UGC";
+  if (/youtube\.com|youtu\.be|vimeo\.com|tiktok\.com/.test(u)) return "Video";
+  if (/\bvs\.?\b|versus|compar|alternative/.test(s)) return "Comparison";
+  if (/\b(best|top)\s*\d*\b|\b\d+\s+(best|top)\b|leading .* (companies|tools|firms|platforms)|list of/.test(t) || /\/(best|top)[-_]/.test(p)) return "Listicle";
+  if (/\breview|rating|g2\.com|capterra|trustpilot|clutch\.co|trustradius|getapp/.test(s)) return "Review";
+  if (/wikipedia\.org|britannica\.com|wikidata/.test(u)) return "Reference";
+  if (/how to|guide|tutorial|what is|explained|\/learn\/|\/guides?\//.test(s)) return "Guide / how-to";
+  if (/docs\.|\/docs\/|documentation|developer\./.test(u)) return "Docs";
+  if (/pricing|\/products?\/|\/features|\/solutions?\/|\/services?\//.test(p)) return "Product / service";
+  if (/\bnews\b|press|\/20\d\d\/\d\d\//.test(s)) return "News";
+  if (p === "/" || p === "") return "Homepage";
+  return "Article";
+}
+const TYPE_ORDER = ["Listicle", "Comparison", "Review", "Article", "Guide / how-to", "Product / service", "Homepage", "Forum / UGC", "Reference", "News", "Docs", "Video"];
+
+function urlsOf(M, m) {
+  const U = new Map();
+  for (const a of m.A) for (const s of a.sources || []) {
+    const k = s.url; const r = U.get(k) || { url: k, title: s.title || "", retr: 0, cited: 0, qids: new Set(), engines: new Set() };
+    r.retr++; if (s.cited) r.cited++; r.qids.add(a.qid); r.engines.add(a.engine); if (!r.title && s.title) r.title = s.title; U.set(k, r);
+  }
+  return [...U.values()].map((r) => { const ins = M.inspections?.[r.url]; const title = ins?.title || r.title; return { ...r, title, type: pageType(r.url, title), domain: host(r.url), you: ins?.ok ? !!ins.you : null, rivals: ins?.rivals || [] }; }).sort((a, b) => b.retr - a.retr);
+}
+
+/* ---------- trend + referrals (overview) ---------- */
+function trendPoints(M) {
+  let pts = trendOf(M.slug);
+  if (!pts.length) { const p = APP.prev?.slug === M.slug ? APP.prev : store.get("prev:" + M.slug, null); if (p?.answers) { const x = metrics(p, "all"); pts = [{ at: p.startedAt, visibility: x.you?.vis, score: x.score, leader: x.brands.find((b) => !b.you) }]; } }
+  const cur = metrics(M, "all");
+  if (!pts.some((t) => Math.abs(t.at - M.startedAt) < 120000)) pts.push({ at: M.startedAt, visibility: cur.you?.vis, score: cur.score, leader: { name: cur.brands.find((b) => !b.you)?.name, vis: cur.brands.find((b) => !b.you)?.vis } });
+  return pts.sort((a, b) => a.at - b.at).slice(-12);
+}
+function trendHtml(M) {
+  const pts = trendPoints(M);
+  if (pts.length < 2) return `<div class="card note"><div class="pad">${icon("rank", 16)} <b>Trends start with your second check.</b> <span class="muted">${DATA.server() ? `Turn on weekly checks in <button type="button" class="lnk" data-page="settings">Settings</button> and White Petal re-runs every prompt on its own.` : "Run the check again next week to see what moved."}</span></div></div>`;
+  const W = 620, H = 170, L = 36, B = 22, max = Math.max(0.1, ...pts.flatMap((p) => [p.visibility || 0, p.leader?.vis || 0]));
+  const top = Math.min(1, Math.ceil(max * 5) / 5);
+  const X = (i) => L + (i * (W - L - 10)) / (pts.length - 1), Y = (v) => 8 + (1 - (v || 0) / top) * (H - B - 8);
+  const line = (k, cls) => `<polyline class="${cls}" points="${pts.map((p, i) => `${X(i).toFixed(1)},${Y(k(p)).toFixed(1)}`).join(" ")}"/>`;
+  const dots = (k, cls) => pts.map((p, i) => `<circle class="${cls}" cx="${X(i).toFixed(1)}" cy="${Y(k(p)).toFixed(1)}" r="3"><title>${new Date(p.at).toLocaleDateString()}: ${pct(k(p), 0)}</title></circle>`).join("");
+  const leaderName = pts[pts.length - 1].leader?.name;
+  return `<div class="card"><div class="card-h"><b>Visibility over time</b><span class="muted">${pts.length} checks</span><span class="sp"></span><span class="leg"><i class="you"></i>You</span>${leaderName ? `<span class="leg"><i></i>${esc(leaderName)} (leader)</span>` : ""}</div>
+    <svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="Your visibility over time compared with the leading competitor">
+      ${[0, 0.5, 1].map((f) => `<line x1="${L}" x2="${W - 10}" y1="${Y(top * f)}" y2="${Y(top * f)}" class="grid"/><text x="${L - 6}" y="${Y(top * f) + 4}" text-anchor="end">${Math.round(top * f * 100)}%</text>`).join("")}
+      ${pts.map((p, i) => (i === 0 || i === pts.length - 1 || pts.length <= 6 ? `<text x="${X(i)}" y="${H - 4}" text-anchor="middle">${new Date(p.at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</text>` : "")).join("")}
+      ${line((p) => p.leader?.vis, "lead")}${dots((p) => p.leader?.vis, "lead")}${line((p) => p.visibility, "you")}${dots((p) => p.visibility, "you")}
+    </svg></div>`;
+}
+function referralHtml(M) {
+  const g = intData(M, "google")?.ga4;
+  if (!g || g.error || g.skipped) return "";
+  const t = g.totals || {}, by = g.byAssistant || [];
+  return `<div class="card"><div class="card-h"><b>Visitors from AI assistants</b><span class="muted">Google Analytics · ${esc(g.dateRange || "last 28 days")}</span></div>
+    <div class="kpis k3 flat"><div class="kpi"><span class="kl">Sessions</span><span class="kv">${(t.sessions || 0).toLocaleString()}</span></div><div class="kpi"><span class="kl">Engaged</span><span class="kv">${(t.engagedSessions || 0).toLocaleString()}</span></div><div class="kpi"><span class="kl">Key events</span><span class="kv">${(t.keyEvents || 0).toLocaleString()}</span></div></div>
+    ${by.slice(0, 6).map((r) => `<div class="erow"><span class="en">${esc(r.assistant)}</span><span class="eb"><i style="width:${Math.round((100 * r.sessions) / Math.max(1, by[0].sessions))}%"></i></span><b>${r.sessions}</b></div>`).join("") || '<p class="muted pad">No visits from AI assistants in this period yet.</p>'}</div>`;
+}
+
+/* ---------- pages ---------- */
+Object.assign(PAGE, {
+  gaps(M, m) {
+    const engs = DASH.eng === "all" ? M.engines : [DASH.eng];
+    const rows = M.questions.map((q) => {
+      const as = engs.flatMap((e) => answersOf(M, q.id, e)).filter(finished);
+      if (!as.length || as.some((a) => a.named)) return null;
+      const rc = {}; as.forEach((a) => (a.brands || []).forEach((b) => { if (!isYou(b, M)) rc[b] = (rc[b] || 0) + 1; }));
+      const rivals = Object.entries(rc).sort((a, b) => b[1] - a[1]);
+      if (!rivals.length) return null;
+      const doms = {}; as.forEach((a) => (a.sources || []).forEach((s) => { const d = host(s.url); doms[d] = (doms[d] || 0) + 1; }));
+      return { q, as, rivals, doms: Object.entries(doms).sort((a, b) => b[1] - a[1]).slice(0, 4) };
+    }).filter(Boolean);
+    const fill = {}; rows.forEach((r) => r.rivals.forEach(([n, c]) => (fill[n] = (fill[n] || 0) + c)));
+    const top = Object.entries(fill).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    return head("Mention gaps", `Prompts where AI recommends a competitor and never you. ${rows.length} of ${M.questions.length} prompts. Each one is a page to publish or a list to get onto.`)
+      + (top.length ? `<div class="card"><div class="card-h"><b>Who fills your gaps</b><span class="muted">Mentions in the answers that leave you out</span></div>${top.map(([n, c]) => `<div class="erow"><span class="en">${letterAv(n)}${esc(n)}</span><span class="eb"><i style="width:${Math.round((100 * c) / top[0][1])}%;background:#9A9AA0"></i></span><b>${c}</b></div>`).join("")}</div>` : "")
+      + `<div class="card">${rows.length ? rows.map((r) => `<div class="gaprow"><div class="gm"><b>${esc(r.q.text)}</b>
+          <span class="chips">${r.rivals.slice(0, 5).map(([n, c]) => `<span class="tagx red">${esc(n)} ${c > 1 ? `×${c}` : ""}</span>`).join("")}</span>
+          <span class="muted sm">AI leaned on ${r.doms.map(([d]) => esc(d)).join(", ") || "no pages"} · ${r.as.length} answer${r.as.length === 1 ? "" : "s"} across ${[...new Set(r.as.map((a) => ENG[a.engine]))].join(", ")}</span></div>
+          <span class="gacts"><button type="button" class="btn ghost sm" data-chat="${esc(akey(r.as[0].qid, r.as[0].engine, r.as[0].sample || 0))}">Read answer</button><button type="button" class="btn sm" data-article="${esc(r.q.id)}">${M.articles?.[r.q.id] ? "Open page draft" : "Draft a page to win it"}</button></span></div>`).join("")
+        : `<p class="pad muted">No gaps: whenever AI recommends someone for your prompts, you're among them.</p>`}</div>`;
+  },
+  rankings(M, m) {
+    const gsc = intData(M, "google")?.gsc, bing = intData(M, "bing");
+    const Q = new Map();
+    for (const a of m.A) for (const s of a.searches || []) { const k = norm(s); if (!k) continue; const r = Q.get(k) || { q: s, n: 0, engines: new Set(), kind: "AI search" }; r.n++; r.engines.add(a.engine); Q.set(k, r); }
+    for (const q of M.questions) if (!Q.has(norm(q.text))) Q.set(norm(q.text), { q: q.text, n: 0, engines: new Set(), kind: "Your prompt" });
+    const list = [...Q.values()].sort((a, b) => b.n - a.n).slice(0, 40);
+    const own = host(M.profile.site || "");
+    const match = (rows, key, q) => { const t = norm(q); return (rows || []).find((r) => { const x = norm(r[key]); return x === t || (x.length > 6 && (t.includes(x) || x.includes(t))); }); };
+    M.serp = M.serp || {};
+    const cell = (q) => {
+      const r = M.serp[norm(q)];
+      if (!r) return APP.cfg.serp ? `<button type="button" class="lnk" data-serp="${esc(q)}">Check Google</button>` : '<span class="muted">–</span>';
+      if (r.error) return `<span class="muted" title="${esc(r.error)}">failed</span>`;
+      const mine = r.results.find((x) => x.domain && own && (x.domain === own || x.domain.endsWith("." + own)));
+      return mine ? `<span class="posb">#${mine.position}</span>` : `<span class="posb no">not in top 10</span> <span class="muted sm">${esc(r.results[0]?.domain || "")}</span>`;
+    };
+    const checked = list.filter((x) => M.serp[norm(x.q)] && !M.serp[norm(x.q)].error), inTop = checked.filter((x) => M.serp[norm(x.q)].results.some((r) => r.domain && (r.domain === own || r.domain.endsWith("." + own))));
+    const cta = [];
+    if (!gsc) cta.push(`<div class="cta">${icon("link", 16)}<div><b>Connect Google Search Console</b><span class="muted">Free. Shows where you rank on Google for these queries, with clicks.</span></div><button type="button" class="btn ghost sm" data-page="settings">Connect</button></div>`);
+    if (!bing) cta.push(`<div class="cta">${icon("link", 16)}<div><b>Connect Bing Webmaster Tools</b><span class="muted">Free. ChatGPT search leans on Bing's index; this shows your Bing positions.</span></div><button type="button" class="btn ghost sm" data-page="settings">Connect</button></div>`);
+    if (!APP.cfg.serp) cta.push(`<div class="cta">${icon("info", 16)}<div><b>Live Google top-10 checks are off</b><span class="muted">Add DATAFORSEO_LOGIN/PASSWORD or SERPAPI_KEY on the server to check any query on demand (paid, about $0.002 a query).</span></div></div>`);
+    return head("Search rankings", "AI answers start with a web search. These are the searches AI ran for your prompts, and where you rank for them. Ranking on page one is still the biggest single lever for being cited.")
+      + (cta.length && DATA.server() ? `<div class="ctas">${cta.join("")}</div>` : "")
+      + `<div class="kpis k4"><div class="kpi"><span class="kl">Queries AI searched</span><span class="kv">${Q.size}</span></div><div class="kpi"><span class="kl">Search Console clicks (28d)</span><span class="kv">${gsc?.totals ? gsc.totals.clicks.toLocaleString() : "–"}</span></div><div class="kpi"><span class="kl">Avg Google position</span><span class="kv">${gsc?.totals?.position || "–"}</span></div><div class="kpi"><span class="kl">Top 10 on Google</span><span class="kv">${checked.length ? `${inTop.length}<small>/${checked.length} checked</small>` : "–"}</span></div></div>`
+      + `<div class="card"><table class="tbl"><thead><tr><th>Query</th><th>Source</th><th class="r">Times searched</th><th class="r">Google (Search Console)</th><th class="r">Bing</th><th class="r">Live Google top 10</th></tr></thead><tbody>
+        ${list.map((x) => { const g = match(gsc?.queries, "query", x.q), b = match(bing?.queries, "query", x.q); return `<tr><td class="pt"><b>${esc(x.q)}</b></td><td><span class="tagx">${x.kind}</span> ${[...x.engines].map((e) => engDot(e)).join("")}</td><td class="r">${x.n || "–"}</td>
+          <td class="r">${g ? `#${g.position} <span class="muted sm">${g.clicks} clicks</span>` : gsc ? '<span class="muted">not ranking</span>' : '<span class="muted">–</span>'}</td>
+          <td class="r">${b ? `#${b.avgPosition ?? "–"} <span class="muted sm">${b.impressions} impr.</span>` : bing ? '<span class="muted">not ranking</span>' : '<span class="muted">–</span>'}</td><td class="r">${cell(x.q)}</td></tr>`; }).join("")}
+      </tbody></table></div>`;
+  },
+  settings(M) {
+    const ws = DATA.ws(M.slug);
+    if (!DATA.server()) return head("Settings", "Scheduling, integrations and history need an account.") + `<div class="card pad"><p>This copy of White Petal is running without a database, so everything is kept in this browser. Deploy it on Google Cloud (see <code>infra/README</code>) or set <code>DATABASE_URL</code>, and you get accounts, weekly checks that run on their own, trend history and integrations with Search Console, GA4, Bing, Cloudflare and Slack.</p></div>`;
+    const d = APP.ints[M.slug]; const ints = d?.integrations || [];
+    const sched = ws?.schedule || "off", samples = ws?.samples || 1;
+    const c = DATA.company(M.slug) || {};
+    return head("Settings", `How White Petal tracks ${esc(M.profile.name)}.`)
+      + `<div class="grid2"><div class="card"><div class="card-h"><b>Automatic checks</b><span class="muted">Runs on the server; you can close the tab</span></div><div class="pad set">
+          <div class="srow"><span>Re-run every prompt</span><div class="seg">${[["off", "Off"], ["weekly", "Weekly"], ["daily", "Daily"]].map(([k, l]) => `<button type="button" data-sched="${k}" aria-pressed="${sched === k}">${l}</button>`).join("")}</div></div>
+          <div class="srow"><span>Answers per prompt <span class="muted sm">averages out AI's run-to-run variation</span></span><div class="seg">${[1, 2, 3].map((k) => `<button type="button" data-samp="${k}" aria-pressed="${samples === k}">${k}×</button>`).join("")}</div></div>
+          <div class="srow"><span class="muted">${ws?.running ? "A check is running now." : ws?.nextRunAt ? `Next check ${new Date(ws.nextRunAt).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}` : "No automatic checks scheduled."}${ws?.lastRunAt ? ` · last ${new Date(ws.lastRunAt).toLocaleDateString()}` : ""}</span><button type="button" class="btn ghost sm" data-queue>Queue a check now</button></div>
+          <p class="muted sm">About ${(c.questions || M.questions).filter((q) => q.on !== false).length * M.engines.length * samples} AI answers per check. Engines: ${M.engines.map((e) => ENG[e]).join(", ")}.</p>
+        </div></div>
+        <div class="card"><div class="card-h"><b>What's tracked</b></div><div class="pad set">
+          <div class="srow"><span>${(c.questions || M.questions).filter((q) => q.on !== false).length} prompts · ${(c.topics || []).length || "–"} topics</span><span class="muted">${(M.profile.competitors || []).length} competitors</span></div>
+          <p class="muted sm">${esc((M.profile.competitors || []).slice(0, 6).join(", "))}</p>
+          <div class="srow"><button type="button" class="btn ghost sm" data-editsetup>Edit prompts and competitors</button><button type="button" class="btn ghost sm" id="delBrand" data-del>Delete brand</button></div>
+        </div></div></div>
+      <div class="sec-h"><h3>Integrations</h3><p>Connect the free tools, and White Petal pulls their data into every check.</p></div>
+      <div class="ints">${!d ? '<p class="muted pad">Loading…</p>' : ints.map((i) => intCard(M, i)).join("")}</div>`;
+  },
+});
+
+function intCard(M, i) {
+  const st = !i.connected ? "" : i.status === "error" ? `<span class="pillx no">Needs attention</span>` : `<span class="pillx ok">Connected</span>`;
+  const fields = (i.fields || []).filter((f) => !(i.id === "google")).map((f) => `<label class="af sm"><span>${esc(f.label)}</span><input data-f="${esc(f.key)}" type="${f.secret ? "password" : "text"}" placeholder="${esc(f.secret && i.connected ? "•••••••• (saved)" : f.placeholder || "")}" value="${esc(f.secret ? "" : i.config?.[f.key] || "")}" autocomplete="off"></label>`).join("");
+  let body = "";
+  if (i.id === "google") {
+    if (!i.available) body = `<p class="muted sm">Needs a Google OAuth client on the server (GOOGLE_OAUTH_CLIENT_ID / SECRET). See infra/README.</p>`;
+    else if (!i.connected) body = `<a class="btn sm" href="/api/oauth/google/start?ws=${encodeURIComponent(M.slug)}">Connect with Google</a>`;
+    else body = `<div class="gprops" data-gprops><button type="button" class="btn ghost sm" data-loadprops>Choose properties</button><span class="muted sm">Search Console: ${esc(i.config?.gscProperty || "not chosen")} · GA4: ${esc(i.config?.ga4PropertyId || "not chosen")}</span></div>`;
+  } else body = `<div class="ifields">${fields}</div>`;
+  const extra = i.id === "indexnow" && i.connected ? `<p class="muted sm">Host this key at <code>https://${esc(host(M.profile.site))}/${esc(i.config?.key || "")}.txt</code> (the file contains just the key).</p>` : "";
+  const sub = ["indexnow", "bing"].includes(i.id) && i.connected ? `<button type="button" class="btn ghost sm" data-submit="${i.id}">Submit site pages</button>` : "";
+  return `<div class="icard" data-int="${esc(i.id)}"><div class="ih"><b>${esc(i.name)}</b>${i.free ? '<span class="tagx">Free</span>' : '<span class="tagx">Paid</span>'}<span class="sp"></span>${st}</div>
+    <p class="muted sm">${esc(i.blurb)}</p>${body}${extra}
+    ${i.detail ? `<p class="idetail ${i.status === "error" ? "bad" : ""}">${esc(i.detail)}</p>` : ""}
+    <div class="iacts">${i.id !== "google" ? `<button type="button" class="btn sm" data-save>${i.connected ? "Update" : "Connect"}</button>` : ""}${i.connected && i.id !== "slack" ? `<button type="button" class="btn ghost sm" data-refresh>Refresh data</button>` : ""}${sub}${i.connected ? `<button type="button" class="lnk sm" data-disconnect>Disconnect</button>` : ""}${i.docs ? `<a class="lnk sm" href="${esc(i.docs)}" target="_blank" rel="noopener">Where to find this</a>` : ""}</div></div>`;
+}
+
+/* ---------- actions on these pages ---------- */
+$("#reportWrap").addEventListener("click", async (e) => {
+  const t = e.target, M = APP.M; if (!M) return;
+  const slug = M.slug, card = t.closest("[data-int]"), id = card?.dataset.int;
+  const busy = (b, txt) => { b.setAttribute("aria-disabled", "true"); const o = b.textContent; b.textContent = txt; return () => { b.removeAttribute("aria-disabled"); b.textContent = o; }; };
+  try {
+    if (t.closest("#navSettings")) { DASH.page = "settings"; return dashRender(); }
+    const sc = t.closest("[data-sched]"); if (sc) { await DATA.patch(slug, { schedule: sc.dataset.sched }); toast(sc.dataset.sched === "off" ? "Automatic checks are off." : `${sc.dataset.sched === "daily" ? "Daily" : "Weekly"} checks are on.`); return dashRender(); }
+    const sp = t.closest("[data-samp]"); if (sp) { await DATA.patch(slug, { samples: +sp.dataset.samp }); return dashRender(); }
+    if (t.closest("[data-queue]")) { await DATA.patch(slug, { runNow: true }); toast("Queued. The server picks it up within the hour, and the results appear here."); return dashRender(); }
+    if (t.closest("[data-editsetup]")) { const c = DATA.company(slug); return startOnboarding(M.profile.site, c || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines }); }
+    const del = t.closest("[data-del]");
+    if (del) { if (del.dataset.armed !== "1") { del.dataset.armed = "1"; del.textContent = "Click again to delete everything"; del.classList.add("danger"); return; } await api("DELETE", `/api/workspaces/${encodeURIComponent(slug)}`); await DATA.refresh(); APP.M = null; toast("Brand deleted."); return home(); }
+    const art = t.closest("[data-article]"); if (art) return articleModal(art.dataset.article);
+    const sq = t.closest("[data-serp]");
+    if (sq) { const done = busy(sq, "Checking…"); const q = sq.dataset.serp; M.serp = M.serp || {};
+      try { const r = await api("POST", "/api/serp/organic", { query: q, market: M.profile.market }); M.serp[norm(q)] = { results: r.results, at: Date.now() }; }
+      catch (err) { M.serp[norm(q)] = { error: err.message }; toast(esc(err.message)); }
+      done(); save(true); return dashRender(); }
+    if (!id) return;
+    if (t.closest("[data-save]")) {
+      const b = t.closest("[data-save]"), done = busy(b, "Checking…"), body = {};
+      card.querySelectorAll("[data-f]").forEach((inp) => { if (inp.value.trim()) body[inp.dataset.f] = inp.value.trim(); });
+      if (id === "bing" && !body.siteUrl && !APP.ints[slug]?.integrations?.find((i) => i.id === "bing")?.config?.siteUrl) body.siteUrl = M.profile.site;
+      try { const r = await api("PUT", `/api/workspaces/${encodeURIComponent(slug)}/integrations/${id}`, body); APP.ints[slug] = { ...APP.ints[slug], integrations: r.integrations }; toast(r.ok ? `Connected. ${esc(r.detail || "")}` : esc(r.detail || "Couldn't connect.")); }
+      finally { done(); } return dashRender();
+    }
+    if (t.closest("[data-refresh]")) { const b = t.closest("[data-refresh]"), done = busy(b, "Refreshing…"); try { const r = await api("POST", `/api/workspaces/${encodeURIComponent(slug)}/integrations/${id}/collect`); APP.ints[slug] = { ...APP.ints[slug], integrations: r.integrations }; toast("Updated."); } finally { done(); } return dashRender(); }
+    if (t.closest("[data-disconnect]")) { const r = await api("DELETE", `/api/workspaces/${encodeURIComponent(slug)}/integrations/${id}`); APP.ints[slug] = { ...APP.ints[slug], integrations: r.integrations }; return dashRender(); }
+    const sub = t.closest("[data-submit]");
+    if (sub) { const done = busy(sub, "Submitting…"); const urls = [M.profile.site, ...(M.audit?.pages || []).map((p) => p.url)].filter(Boolean);
+      try { const r = await api("POST", `/api/workspaces/${encodeURIComponent(slug)}/integrations/${id}/submit`, { urls }); toast(esc(r.detail || `Submitted ${r.submitted ?? urls.length} pages.`)); } finally { done(); } return; }
+    if (t.closest("[data-loadprops]")) {
+      const box = card.querySelector("[data-gprops]"); box.innerHTML = '<span class="muted sm">Loading your properties…</span>';
+      const p = await api("POST", `/api/workspaces/${encodeURIComponent(slug)}/integrations/google/properties`);
+      const cur = APP.ints[slug]?.integrations?.find((i) => i.id === "google")?.config || {};
+      box.innerHTML = `<label class="af sm"><span>Search Console property</span><select data-f="gscProperty"><option value="">None</option>${(p.gsc || []).map((s) => `<option ${s === cur.gscProperty ? "selected" : ""}>${esc(s)}</option>`).join("")}</select></label>
+        <label class="af sm"><span>GA4 property</span><select data-f="ga4PropertyId"><option value="">None</option>${(p.ga4 || []).map((g) => `<option value="${esc(g.id)}" ${String(g.id) === String(cur.ga4PropertyId) ? "selected" : ""}>${esc(g.name || g.id)}</option>`).join("")}</select></label>
+        <button type="button" class="btn sm" data-saveprops>Save</button>`;
+      return;
+    }
+    if (t.closest("[data-saveprops]")) { const body = {}; card.querySelectorAll("[data-f]").forEach((s) => (body[s.dataset.f] = s.value)); const r = await api("PUT", `/api/workspaces/${encodeURIComponent(slug)}/integrations/google`, body); APP.ints[slug] = { ...APP.ints[slug], integrations: r.integrations }; toast(r.ok ? "Saved. Pulling your Search Console and GA4 data." : esc(r.detail)); return dashRender(); }
+  } catch (err) { toast(esc(err.message)); }
+});
+
+// A page built to win one prompt, written on demand (same writer the action deck uses).
+async function articleModal(qid) {
+  const M = APP.M, q = M.questions.find((x) => x.id === qid); if (!q) return;
+  M.articles = M.articles || {};
+  modal(`<span class="status">Mention gap · ${esc(q.intent || "")}</span><h3>A page to win “${esc(q.text)}”</h3><p class="muted sm">Built to be the page AI cites: a direct answer first, question headings, a fair comparison table and an FAQ. Anything the agent can't verify is marked [TODO].</p><div class="pre md" id="amText">${M.articles[qid] ? md(M.articles[qid]) : ""}</div><div style="display:flex;gap:8px"><button class="btn sm" type="button" id="amCopy">Copy</button></div>`);
+  $(".modal:last-of-type .box").style.maxWidth = "860px";
+  const out = $("#amText"); let txt = M.articles[qid] || "";
+  $("#amCopy").onclick = async (e) => { e.stopPropagation(); try { await navigator.clipboard.writeText(txt); e.target.textContent = "Copied ✓"; } catch { e.target.textContent = "Select the text to copy"; } };
+  if (txt) return;
+  out.classList.add("typing"); const paint = throttled(() => { out.innerHTML = md(txt); });
+  const rivals = [...new Set(M.engines.flatMap((e) => answersOf(M, qid, e).flatMap((a) => a.brands || [])))].filter((x) => !isYou(x, M));
+  try { await stream("/api/write", { kind: "article", data: { profile: M.profile, question: q.text, rivals, siteText: M.siteText } }, { delta: (d) => { txt += d.text; paint(); } }); }
+  catch (err) { toast(esc(err.message)); }
+  out.classList.remove("typing"); out.innerHTML = md(txt); if (txt) { M.articles[qid] = txt; save(true); }
+}
+
+/* ---------- sources by URL and content type ---------- */
+const srcSwitch = () => `<div class="segc inl">${[["domains", "Domains"], ["urls", "URLs & content types"]].map(([k, l]) => `<button type="button" data-srcview="${k}" aria-pressed="${(DASH.srcView || "domains") === k}">${l}</button>`).join("")}</div>`;
+function urlsPage(M, m) {
+  const urls = urlsOf(M, m), total = urls.reduce((s, u) => s + u.retr, 0) || 1;
+  const T = {}; urls.forEach((u) => { const t = (T[u.type] ||= { type: u.type, retr: 0, urls: 0, you: 0, rivalsOnly: 0 }); t.retr += u.retr; t.urls++; if (u.you) t.you++; else if (u.you === false && u.rivals.length) t.rivalsOnly++; });
+  const types = Object.values(T).sort((a, b) => b.retr - a.retr), max = Math.max(1, ...types.map((t) => t.retr));
+  const f = DASH.urlType || "all", list = urls.filter((u) => f === "all" || u.type === f);
+  const ownTypes = [...new Set(urls.filter((u) => domainType(u.domain, M) === "You").map((u) => u.type))];
+  const win = types[0];
+  return head("URLs & content types", `The exact pages AI cites, and what kind of page they are. ${win ? `${esc(win.type)} pages earn ${pct(win.retr / total, 0)} of all citations here${ownTypes.includes(win.type) ? "" : ", and AI cites none of yours yet"}.` : ""}`) + srcSwitch()
+    + `<div class="grid2"><div class="card"><div class="card-h"><b>Content types AI cites</b><span class="muted">Share of citations</span></div>
+        ${types.map((t) => `<div class="hbar"><span class="hb" style="width:${Math.max(30, (100 * t.retr) / max)}%"><span>${esc(t.type)}</span></span><span class="hn">${pct(t.retr / total, 0)}</span></div>`).join("")}</div>
+      <div class="card"><div class="card-h"><b>Where you stand by type</b><span class="muted">Pages the agent opened</span></div><table class="tbl"><thead><tr><th>Type</th><th class="r">Cited URLs</th><th class="r">Mention you</th><th class="r">Rivals only</th></tr></thead><tbody>
+        ${types.map((t) => `<tr><td>${esc(t.type)}</td><td class="r">${t.urls}</td><td class="r">${t.you || "–"}</td><td class="r">${t.rivalsOnly ? `<span class="pillx no">${t.rivalsOnly}</span>` : "–"}</td></tr>`).join("")}</tbody></table></div></div>
+      <div class="segc inl">${["all", ...types.map((t) => t.type)].map((k) => `<button type="button" data-utype="${esc(k)}" aria-pressed="${f === k}">${k === "all" ? `All · ${urls.length}` : esc(k)}</button>`).join("")}</div>
+      <div class="card"><table class="tbl"><thead><tr><th>Page</th><th>Type</th><th class="r">Retrievals</th><th class="r">Cited</th><th>You on it</th><th>Rivals on it</th></tr></thead><tbody>
+      ${list.slice(0, 150).map((u) => `<tr><td class="pt"><span class="bcell">${favImg(u.domain)}<span><a href="${esc(safeUrl(u.url) || "#")}" target="_blank" rel="noopener"><b>${esc(u.title || u.url)}</b></a><br><span class="muted sm">${esc(u.domain)}</span></span></span></td><td><span class="tagx">${esc(u.type)}</span></td><td class="r">${u.retr}</td><td class="r">${u.cited}</td>
+        <td>${u.you == null ? '<span class="muted">not opened</span>' : u.you ? '<span class="pillx ok">Yes</span>' : '<span class="pillx no">No</span>'}</td><td class="muted ell">${esc(u.rivals.slice(0, 3).join(", "))}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">No cited pages in this view.</td></tr>'}</tbody></table></div>`;
+}
+
+/* ---------- My website: the deeper checks ---------- */
+function siteExtra(M) {
+  const a = M.audit || {}, pages = a.pages || [], e = M.entity, cf = intData(M, "cloudflare"), bing = intData(M, "bing");
+  const fails = {}; pages.forEach((p) => (p.checks || (p.fails || []).map((label) => ({ label, pass: false }))).forEach((c) => { if (!c.pass) fails[c.label] = (fails[c.label] || 0) + 1; }));
+  const topFails = Object.entries(fails).sort((x, y) => y[1] - x[1]).slice(0, 8);
+  const why = Object.fromEntries(pages.flatMap((p) => (p.checks || []).map((c) => [c.label, c.why])));
+  return `<div class="grid2">
+    <div class="card"><div class="card-h"><b>Most common page problems</b><span class="muted">${pages.length} pages scored</span></div>
+      ${topFails.length ? topFails.map(([l, n]) => `<div class="frow"><div><b>${esc(l)}</b><span class="muted sm">${esc(why[l] || "")}</span></div><span class="pillx ${n === pages.length ? "no" : "warn"}">${n}/${pages.length} pages</span></div>`).join("") : '<p class="muted pad">Every check passes.</p>'}
+      ${a.jsOnly ? `<p class="idetail bad pad">${a.jsOnly} page${a.jsOnly === 1 ? "" : "s"} only show their words after JavaScript runs. Most AI crawlers don't run it, so to them these pages are empty. Server-render or pre-render them.</p>` : ""}</div>
+    <div class="card"><div class="card-h"><b>Does AI know who you are?</b><span class="muted">Knowledge graphs${e ? ` · ${e.score}/100` : ""}</span><span class="sp"></span><button type="button" class="lnk" data-entity>${e ? "Re-check" : "Check now"}</button></div>
+      ${e ? (e.checks || []).map((c) => `<div class="frow"><div><b>${esc(c.label)}</b><span class="muted sm">${esc(c.why || "")}</span></div>${c.pass == null ? '<span class="pillx">n/a</span>' : c.pass ? '<span class="pillx ok">Yes</span>' : '<span class="pillx no">No</span>'}</div>`).join("") : '<p class="muted pad">Checks Wikidata and Google\'s Knowledge Graph, and compares them with the Organization schema on your homepage.</p>'}</div></div>
+    <div class="grid2">
+    <div class="card"><div class="card-h"><b>AI crawlers visiting</b><span class="muted">${cf ? `Cloudflare · last ${cf.window?.days || 7} days` : "Cloudflare"}</span></div>
+      ${cf ? (cf.bots || []).slice(0, 10).map((b) => `<div class="erow"><span class="en">${esc(b.bot || b.name || "")}</span><span class="eb"><i style="width:${Math.round((100 * b.requests) / Math.max(1, cf.bots[0].requests))}%"></i></span><b>${b.requests.toLocaleString()}</b></div>`).join("") || '<p class="muted pad">No AI crawler visits in this window.</p>'
+        : `<p class="muted pad">Connect Cloudflare (free) in <button type="button" class="lnk" data-page="settings">Settings</button> to see GPTBot, PerplexityBot, ClaudeBot and others hitting your site, and which pages they read.</p>`}</div>
+    <div class="card"><div class="card-h"><b>Bing index</b><span class="muted">ChatGPT search leans on Bing</span></div>
+      ${bing?.crawl?.latest ? `<div class="kpis k3 flat"><div class="kpi"><span class="kl">Pages in index</span><span class="kv">${bing.crawl.latest.inIndex.toLocaleString()}</span></div><div class="kpi"><span class="kl">Crawl errors</span><span class="kv">${bing.crawl.latest.crawlErrors}</span></div><div class="kpi"><span class="kl">Blocked by robots</span><span class="kv">${bing.crawl.latest.blockedByRobotsTxt}</span></div></div>`
+        : `<p class="muted pad">Connect Bing Webmaster Tools (free) in <button type="button" class="lnk" data-page="settings">Settings</button> to see how much of your site Bing has indexed, and to push new pages to it instantly with IndexNow.</p>`}</div></div>`;
+}
+const _sitePage = PAGE.site;
+PAGE.site = (M, m, pm) => _sitePage(M, m, pm) + siteExtra(M);
+$("#reportWrap").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-entity]"); if (!b || !APP.M) return;
+  const M = APP.M; b.textContent = "Checking…";
+  try { M.entity = await post("/api/entity", { name: M.profile.name, site: M.profile.site, orgSchema: M.audit?.org ?? null }); save(true); } catch (err) { toast(esc(err.message)); }
+  dashRender();
 });
 
 /* =================================================================== LEAVING & COMING BACK */
@@ -1447,15 +2040,22 @@ document.addEventListener("visibilitychange", () => {
 
 /* =================================================================== BOOT */
 (async () => {
-  stars(); renderRecent(); paintIcons();
+  paintIcons();
   $$(".wordmark .pq").forEach((m) => m.classList.add("anim"));
-  try { APP.cfg = await (await fetch("/api/config")).json(); } catch { $("#startErr").textContent = "Can't reach the server."; }
+  try { APP.cfg = await (await fetch("/api/config", { cache: "no-store" })).json(); } catch { $("#startErr").textContent = "Can't reach the server."; }
+  APP.user = APP.cfg.user || null;
   if (APP.cfg.access) { $("#accessRow").hidden = false; $("#accessCode").value = APP.code || ""; }
+  paintLanding();
+  if (DATA.server()) { try { await DATA.refresh(); } catch {} }
   if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").textContent = "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
   // This tab was running a check when it navigated away or reloaded: carry on without asking.
   let auto = null; try { auto = sessionStorage.getItem(AUTO); sessionStorage.removeItem(AUTO); } catch {}
   const m = auto && store.get("mission:" + auto, null);
   if (m && !m.finishedAt && m.profile && m.done && APP.cfg.engines?.length && !(await lockedElsewhere(auto))) return resumeMission(m);
-  $("#startUrl").focus();
+  // A link back from Google sign-in lands on the brand's settings.
+  const hm = location.hash.match(/^#settings\/([^?]+)(?:\?(.*))?/);
+  if (hm && DATA.server()) { history.replaceState(null, "", location.pathname); if (await openBrand(decodeURIComponent(hm[1]), { quiet: true })) { DASH.page = "settings"; dashRender(); if (/google=connected/.test(hm[2] || "")) toast("Google connected. Choose your Search Console and GA4 properties."); return; } }
+  if (DATA.server() && DATA.list.length) return home();
+  renderRecent(); $("#startUrl").focus();
 })();
 })();

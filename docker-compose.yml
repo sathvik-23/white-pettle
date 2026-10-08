@@ -1,0 +1,78 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  Local development: Postgres 17 + the app, built from the same Dockerfile
+#  production runs.
+#
+#      docker compose up --build        # → http://localhost:8080
+#      docker compose down              # keeps the database volume
+#      docker compose down -v           # wipes it (migrations re-run on boot)
+#
+#  Postgres 17 because production is perfstaq-pg (POSTGRES_17). Developing
+#  against a different major is how a migration that uses a 17-only feature
+#  passes locally and fails at boot in production.
+#
+#  Provider keys come from .env.local (git- and docker-ignored). Without it
+#  the app still boots and the health check still answers — a missing key
+#  disables that engine, it never stops the server (same contract as Cloud
+#  Run, where a secret with no version is simply skipped).
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: whitepetal
+      POSTGRES_PASSWORD: whitepetal # local only; this port is bound to 127.0.0.1
+      POSTGRES_DB: whitepetal
+    ports:
+      # 127.0.0.1, not 0.0.0.0: a trivially-passworded Postgres must not be
+      # reachable from the café Wi-Fi.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whitepetal -d whitepetal"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    # tini is already PID 1 inside the image; `init` here would add a second.
+    depends_on:
+      db:
+        # Without this the app races Postgres on first boot and its
+        # migrations fail with ECONNREFUSED before the DB has initialised.
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PORT: "8080"
+      # Compose overrides NODE_ENV=production from the image so local errors
+      # are verbose; flip it to production to reproduce a prod-only bug.
+      NODE_ENV: development
+      # TCP to the compose service. Production uses the Cloud SQL Unix socket
+      # (?host=/cloudsql/...) instead — node-postgres accepts both forms, so
+      # the code path that matters is the same.
+      DATABASE_URL: postgres://whitepetal:whitepetal@db:5432/whitepetal
+      # Secret Manager is OFF locally: keys come from .env.local below.
+      SECRETS_FROM_GSM: "0"
+      PUBLIC_ORIGIN: http://localhost:8080
+      # Lets cron be exercised by hand:
+      #   curl -X POST -H 'x-cron-secret: local-cron' localhost:8080/api/cron/tick
+      CRON_SECRET: local-cron
+      APP_SECRET: local-dev-secret-not-for-production-0000000000
+    env_file:
+      # Optional, so a fresh clone without keys still starts (Compose 2.24+).
+      - path: .env.local
+        required: false
+    # Live editing without rebuilding: the source is bind-mounted read-only
+    # over the copy baked into the image, and node restarts on change.
+    # node_modules stays the image's (Linux) copy, never the host's.
+    volumes:
+      - ./server:/app/server:ro
+      - ./api:/app/api:ro
+      - ./public:/app/public:ro
+    command: ["node", "--watch-path=server", "--watch-path=api", "server/index.mjs"]
+
+volumes:
+  pgdata:

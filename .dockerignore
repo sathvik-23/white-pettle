@@ -1,0 +1,48 @@
+# The build context is sent IN FULL to the daemon before the first Dockerfile
+# line runs. (`gcloud builds submit` filters its upload with .gitignore — there
+# is no .gcloudignore — and then this file applies again inside Cloud Build.)
+# Everything here is bytes nobody needs, and the .env* entries are
+# load-bearing for security, not speed.
+
+# Never in an image: secrets. `.env.local` holds the founder's real provider
+# keys; an image is pushed to a registry, and a secret in a layer is a secret
+# forever, even if a later layer deletes it.
+.env
+.env.*
+!.env.example
+
+# Reinstalled cleanly by `npm ci` inside the image. A host node_modules
+# (macOS binaries, dev deps) copied in would be both wrong and huge.
+node_modules
+npm-debug.log*
+
+# Version control and editor noise.
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+
+# Not part of the runtime.
+test
+tests
+docs
+infra
+*.md
+*.command
+dev.mjs
+vercel.json
+.vercel
+docker-compose.yml
+Dockerfile
+.dockerignore
+.test_flow_ref.py
+*.py
+screenshots
+**/screenshots
+coverage
+*.log
+*.tfstate
+*.tfstate.*
+*.tfplan

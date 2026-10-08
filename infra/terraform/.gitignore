@@ -1,0 +1,18 @@
+# Provider plugins and lock metadata for this working directory.
+.terraform/
+
+# Saved plans. A plan file carries RESOLVED values — including the generated
+# database password and CRON_SECRET — so committing one publishes them.
+*.tfplan
+tfplan
+
+# State never lives here; it is in the GCS backend named in versions.tf
+# (prefix `whitepetal`). These would only appear if someone ran without the
+# backend configured, and they would contain every generated secret.
+*.tfstate
+*.tfstate.*
+
+# terraform.tfvars is NOT ignored on purpose: it holds no secrets (domain,
+# max_instances), and a value that lives on one laptop only is a value the
+# next apply from another machine silently reverts — e.g. deleting the
+# domain mapping.
