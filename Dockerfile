@@ -77,6 +77,14 @@ COPY server/ ./server/
 COPY api/    ./api/
 COPY public/ ./public/
 
+# COPY keeps the source files' permission bits. A checkout on a laptop can have
+# 0600 files (readable only by their owner), which here means root-only, and the
+# server, running as `node`, then dies at boot with EACCES on its own code.
+# Make everything world-readable (dirs traversable), still owned by root and not
+# writable by `node`. Plain RUN, not COPY --chmod: the classic builder that
+# `gcloud builds submit --tag` uses does not support --chmod.
+RUN chmod -R a+rX /app
+
 USER node
 
 # Cloud Run injects PORT=8080 and refuses a service that sets PORT itself;
