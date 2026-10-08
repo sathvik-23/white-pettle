@@ -101,6 +101,28 @@ info "APIs enabled"
 gcloud storage buckets describe "gs://$STATE_BUCKET" >/dev/null 2>&1 \
   || die "state bucket gs://$STATE_BUCKET not found — it is PerfStaq's and must exist already"
 
+# ── 2b. With --rebuild on an existing service: ship the code BEFORE Terraform ─
+# Any Terraform change to the service (an env var, a probe) rolls a new
+# revision of the image the service CURRENTLY runs. If that image is broken,
+# every apply fails there, and step 5 (which would replace it) never runs. So
+# when the service and registry already exist, build and roll out first;
+# Terraform then applies its changes on top of a working image.
+EARLY=0
+if [ "$REBUILD" = 1 ] \
+   && gc run services describe "$SERVICE" --region="$REGION" >/dev/null 2>&1 \
+   && gc artifacts repositories describe "$SERVICE" --location="$REGION" >/dev/null 2>&1; then
+  step "Building and rolling out the code first (--rebuild)"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    warn "the working tree has uncommitted changes — they WILL be in this image"
+  fi
+  IMAGE="$REGION-docker.pkg.dev/$PROJECT/$SERVICE/$SERVICE:bootstrap-$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || date +%s)"
+  gc builds submit "$ROOT" --tag="$IMAGE" || die "Cloud Build failed (see the build log above)."
+  gc run services update "$SERVICE" --region="$REGION" --image="$IMAGE" || die "the new image did not start. Its logs:
+  gcloud logging read 'resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\"' --project=$PROJECT --limit=60 --format='value(timestamp,severity,textPayload)'"
+  info "running $IMAGE"
+  EARLY=1
+fi
+
 # ── 3. Terraform ────────────────────────────────────────────────────────────
 step "terraform init + apply (state: gs://$STATE_BUCKET/whitepetal)"
 tf init -input=false >/dev/null
@@ -159,7 +181,9 @@ done
 # ── 5. First image ──────────────────────────────────────────────────────────
 CURRENT_IMAGE="$(gc run services describe "$SERVICE" --region="$REGION" --format='value(spec.template.spec.containers[0].image)')"
 DEPLOYED=0
-if [ "$REBUILD" = 1 ] || [ "$CURRENT_IMAGE" = "$PLACEHOLDER" ] || [ -z "$CURRENT_IMAGE" ]; then
+if [ "$EARLY" = 1 ]; then
+  info "already rolled out before Terraform: $CURRENT_IMAGE"
+elif [ "$REBUILD" = 1 ] || [ "$CURRENT_IMAGE" = "$PLACEHOLDER" ] || [ -z "$CURRENT_IMAGE" ]; then
   step "Building the first image with Cloud Build"
   if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
     warn "the working tree has uncommitted changes — they WILL be in this image"
