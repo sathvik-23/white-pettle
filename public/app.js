@@ -26,7 +26,7 @@ const store = {
 const APP = { cfg: { engines: [], llm: false, access: false }, code: store.get("code", ""), M: null, ctl: null, running: false };
 async function post(path, payload, signal) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
-  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } throw new Error("The access code is missing or wrong."); }
+  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
   return d;
@@ -43,7 +43,7 @@ async function stream(path, payload, on, signal, idleMs = 75000) {
 }
 async function streamInner(path, payload, on, signal, kick) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
-  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } throw new Error("The access code is missing or wrong."); }
+  if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
   if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
   const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", err = null;
   for (;;) {

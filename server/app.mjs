@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { ROOT } from "./env.mjs";
 
 import { connect, migrate, ping, hasDb, close } from "./db.mjs";
-import { ROUTES, gate, currentUser } from "./routes.mjs";
+import { ROUTES, gate, currentUser, isLocalDev } from "./routes.mjs";
 import { HttpError, sendJson } from "./http.mjs";
 
 // The original AI handlers. They spend money, so the server gates them: a signed-in user (with a database), or
@@ -60,7 +60,7 @@ async function handleAi(req, res, name, url) {
   const out = await (await aiHandler(name))(request);
   if (name === "config") { // the browser's view of what this server can do
     const cfg = await out.json(); const user = hasDb() ? await currentUser(req) : null;
-    return sendJson(res, 200, { ...cfg, db: hasDb(), auth: hasDb(), access: hasDb() ? false : cfg.access, invite: hasDb() && !!process.env.ACCESS_CODE, user: user ? { email: user.email, name: user.name } : null,
+    return sendJson(res, 200, { ...cfg, db: hasDb(), auth: hasDb(), access: hasDb() || isLocalDev(req) ? false : cfg.access, invite: hasDb() && !!process.env.ACCESS_CODE, user: user ? { email: user.email, name: user.name } : null,
       serp: cfg.engines.includes("aio"), googleOAuth: !!process.env.GOOGLE_OAUTH_CLIENT_ID, version: process.env.K_REVISION || "dev" });
   }
   res.writeHead(out.status, Object.fromEntries(out.headers));
@@ -106,6 +106,14 @@ const server = http.createServer(async (req, res) => {
 server.requestTimeout = 0; server.headersTimeout = 65000; server.keepAliveTimeout = 65000;
 
 await new Promise((ok) => server.listen(port, ok));
-if (!quiet) console.log(`\n  White Petal → http://localhost:${server.address().port}\n`);
+if (!quiet) {
+  const { engines } = await import("../api/_lib.js");
+  const keys = engines();
+  console.log(`\n  White Petal → http://localhost:${server.address().port}`);
+  console.log(`  accounts: ${hasDb() ? "on (Postgres)" : "off (no DATABASE_URL, data stays in the browser)"}`);
+  console.log(`  engines:  ${keys.length ? keys.join(", ") : "none: add GEMINI_API_KEY or OPENAI_API_KEY to .env.local"}`);
+  if (process.env.ACCESS_CODE) console.log(`  access code: ${hasDb() ? "required at sign-up" : "required, except from this machine"}`);
+  console.log("");
+}
 return { server, port: server.address().port, stop: () => new Promise((ok) => server.close(() => close().finally(ok))) };
 }

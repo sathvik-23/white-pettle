@@ -308,8 +308,14 @@ export const ROUTES = [
 ];
 
 // Who may spend AI credits: a signed-in user, or (no database) whoever has the access code.
+// A request from this same machine to a dev server (npm run dev) is the owner testing: no access code needed.
+// Never in production, and never through a proxy (Cloud Run always adds x-forwarded-for).
+export function isLocalDev(req) {
+  if (process.env.NODE_ENV === "production" || req.headers["x-forwarded-for"]) return false;
+  return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket?.remoteAddress);
+}
 export async function gate(req) {
   if (hasDb()) { const u = await currentUser(req); if (u) return u; fail(401, "Please sign in.", { code: "auth" }); }
-  if (process.env.ACCESS_CODE && req.headers["x-access-code"] !== process.env.ACCESS_CODE) fail(401, "Access code required", { code: "access" });
+  if (process.env.ACCESS_CODE && !isLocalDev(req) && req.headers["x-access-code"] !== process.env.ACCESS_CODE) fail(401, "Access code required", { code: "access" });
   return null;
 }
