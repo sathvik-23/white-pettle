@@ -24,8 +24,10 @@ const store = {
 
 /* =================================================================== API */
 const APP = { cfg: { engines: [], llm: false, access: false }, code: store.get("code", ""), M: null, ctl: null, running: false };
+// Every AI call says which brand it is for, so the organisation's usage meter can split spend by brand.
+const aiHeaders = () => ({ "content-type": "application/json", "x-access-code": APP.code || "", "x-wp-brand": APP.M?.slug || "" });
 async function post(path, payload, signal) {
-  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
+  const r = await fetch(path, { method: "POST", headers: aiHeaders(), body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
@@ -42,7 +44,7 @@ async function stream(path, payload, on, signal, idleMs = 75000) {
   finally { clearTimeout(timer); signal?.removeEventListener("abort", onOuter); }
 }
 async function streamInner(path, payload, on, signal, kick) {
-  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-access-code": APP.code || "" }, body: JSON.stringify(payload), signal, cache: "no-store" });
+  const r = await fetch(path, { method: "POST", headers: aiHeaders(), body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
   if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
   const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", err = null;
@@ -69,7 +71,7 @@ async function streamInner(path, payload, on, signal, kick) {
    through DATA and does not care which. */
 APP.user = null; APP.prev = null;
 async function api(method, path, body) {
-  const r = await fetch(path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin", cache: "no-store" });
+  const r = await fetch(path, { method, headers: body ? { "content-type": "application/json", "x-wp-brand": APP.M?.slug || "" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin", cache: "no-store" });
   const d = await r.json().catch(() => ({}));
   if (r.status === 401 && d.code === "auth") { APP.user = null; showAuth("signin"); throw new Error("Please sign in."); }
   if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
@@ -125,39 +127,92 @@ const DATA = {
 };
 const trendOf = (slug) => (DATA.ws(slug)?.trend || []).map((t) => ({ at: Date.parse(t.started_at), source: t.source, ...t.summary })).filter((t) => t.n);
 
-/* ---------- sign in / sign up ---------- */
-let AUTH = { mode: "signup", after: null };
+/* ---------- sign in / sign up / forgot / reset, and invite links ---------- */
+let AUTH = { mode: "signup", after: null, invite: null, inviteInfo: null, reset: null };
 function showAuth(mode = "signup", after) {
   AUTH.mode = mode; if (after !== undefined) AUTH.after = after;
-  screen("auth"); paintAuth(); setTimeout(() => $(AUTH.mode === "signup" ? "#authName" : "#authEmail")?.focus(), 30);
+  screen("auth"); paintAuth(); setTimeout(() => $(AUTH.mode === "signup" && !AUTH.inviteInfo ? "#authName" : AUTH.mode === "reset" ? "#authPass" : "#authEmail")?.focus(), 30);
 }
 function paintAuth() {
-  const up = AUTH.mode === "signup";
-  $("#authTitle").textContent = up ? "Create your White Petal account" : "Sign in to White Petal";
-  $("#authSub").textContent = AUTH.after?.url ? `Then we'll start on ${host(AUTH.after.url)}.` : up ? "Track how AI search talks about your brand, every week." : "Welcome back.";
-  $$("#authForm [data-only]").forEach((el) => (el.hidden = !up || (el.dataset.only === "invite" && !APP.cfg.invite)));
-  $("#authGo").textContent = up ? "Create account" : "Sign in";
-  $("#authPass").autocomplete = up ? "new-password" : "current-password";
-  $("#authSwitchTxt").textContent = up ? "Already have an account?" : "New to White Petal?";
-  $("#authSwitch").textContent = up ? "Sign in" : "Create an account";
-  $("#authErr").textContent = "";
+  const m = AUTH.mode, up = m === "signup", inv = AUTH.inviteInfo;
+  $("#authTitle").textContent = { signup: inv ? `Join ${inv.org} on White Petal` : "Create your White Petal account", signin: inv ? `Sign in to join ${inv.org}` : "Sign in to White Petal", forgot: "Reset your password", reset: "Choose a new password" }[m];
+  $("#authSub").textContent = m === "forgot" ? "We'll email you a link to set a new one." : m === "reset" ? "At least 8 characters. You'll be signed out everywhere else." : AUTH.after?.url ? `Then we'll start on ${host(AUTH.after.url)}.` : up ? "Track how AI search talks about your brand, every week." : "Welcome back.";
+  $("#authInvite").hidden = !inv;
+  if (inv) $("#authInvite").innerHTML = `${inv.inviter ? `<b>${esc(inv.inviter)}</b> invited <b>${esc(inv.email)}</b>` : `<b>${esc(inv.email)}</b> is invited`} to <b>${esc(inv.org)}</b> as ${esc({ owner: "the owner", admin: "an admin", editor: "an editor", viewer: "a viewer" }[inv.role] || inv.role)}.`;
+  $$("#authForm [data-only]").forEach((el) => (el.hidden = !up || (el.dataset.only === "invite" && (!APP.cfg.invite || !!inv))));
+  $("#authEmailRow").hidden = m === "reset";
+  $("#authPassRow").hidden = m === "forgot";
+  $("#authPassLbl").textContent = m === "reset" ? "New password" : "Password";
+  if (inv) { $("#authEmail").value = inv.email; $("#authEmail").readOnly = true; } else $("#authEmail").readOnly = false;
+  const g = !!APP.cfg.googleLogin && (m === "signup" || m === "signin");
+  $("#authGoogle").hidden = !g; $("#authOr").hidden = !g;
+  $("#authGo").textContent = { signup: inv ? "Create account and join" : "Create account", signin: inv ? "Sign in and join" : "Sign in", forgot: "Email me a link", reset: "Save and sign in" }[m];
+  $("#authPass").autocomplete = up || m === "reset" ? "new-password" : "current-password";
+  $("#authSwitchTxt").textContent = up ? "Already have an account?" : m === "signin" ? "New to White Petal?" : "Remembered it?";
+  $("#authSwitch").textContent = up ? "Sign in" : m === "signin" ? "Create an account" : "Sign in";
+  $("#authSwitch").parentElement.hidden = m === "reset";
+  $("#authForgotRow").hidden = m !== "signin";
+  $("#authErr").textContent = ""; $("#authOk").textContent = "";
 }
-$("#authSwitch").addEventListener("click", () => { AUTH.mode = AUTH.mode === "signup" ? "signin" : "signup"; paintAuth(); });
+$("#authSwitch").addEventListener("click", () => { AUTH.mode = AUTH.mode === "signin" ? "signup" : "signin"; paintAuth(); });
+$("#authForgot").addEventListener("click", () => { AUTH.mode = "forgot"; paintAuth(); $("#authEmail").focus(); });
+$("#authGoogle").addEventListener("click", () => { location.href = "/api/auth/google/start" + (AUTH.invite ? "?invite=" + encodeURIComponent(AUTH.invite) : ""); });
 $("#authForm").addEventListener("submit", async (e) => {
-  e.preventDefault(); const up = AUTH.mode === "signup", btn = $("#authGo");
-  btn.setAttribute("aria-disabled", "true"); $("#authErr").textContent = "";
+  e.preventDefault(); const m = AUTH.mode, btn = $("#authGo");
+  btn.setAttribute("aria-disabled", "true"); $("#authErr").textContent = ""; $("#authOk").textContent = "";
   try {
-    const d = await api("POST", up ? "/api/auth/signup" : "/api/auth/login", { email: $("#authEmail").value, password: $("#authPass").value, name: $("#authName").value, code: $("#authCode").value });
+    if (m === "forgot") { await api("POST", "/api/auth/forgot", { email: $("#authEmail").value }); $("#authOk").textContent = "If there's an account for that email, a reset link is on its way. It works for an hour."; return; }
+    const d = m === "reset" ? await api("POST", "/api/auth/reset", { token: AUTH.reset, password: $("#authPass").value })
+      : await api("POST", m === "signup" ? "/api/auth/signup" : "/api/auth/login", { email: $("#authEmail").value, password: $("#authPass").value, name: $("#authName").value, code: $("#authCode").value, invite: AUTH.invite || undefined });
     APP.user = d.user; $("#authPass").value = "";
-    await DATA.refresh();
+    const joined = AUTH.inviteInfo; AUTH.invite = AUTH.inviteInfo = AUTH.reset = null;
+    await reloadConfig(); await DATA.refresh();
+    if (joined) toast(`You're in ${esc(joined.org)}.`);
     const after = AUTH.after; AUTH.after = null;
-    if (after?.url) return startOnboarding(after.url);
+    if (after?.url && canEdit()) return startOnboarding(after.url);
     return home();
   } catch (err) { $("#authErr").textContent = err.message; }
   finally { btn.removeAttribute("aria-disabled"); }
 });
 $("#lpAuth").addEventListener("click", () => showAuth("signin", null));
-$("#signOut").addEventListener("click", async () => { try { await api("POST", "/api/auth/logout"); } catch {} APP.user = null; DATA.list = []; APP.M = null; goHome(); });
+$("#signOut").addEventListener("click", async () => { try { await api("POST", "/api/auth/logout"); } catch {} APP.user = null; APP.org = null; APP.orgs = []; DATA.list = []; APP.M = null; goHome(); });
+
+// The organisation this session works in, and what the person may do there.
+APP.org = null; APP.orgs = []; APP.operator = false;
+const ROLE_RANK = { viewer: 0, editor: 1, admin: 2, owner: 3 };
+const roleAtLeast = (r) => !DATA.server() || (ROLE_RANK[APP.org?.role] ?? -1) >= ROLE_RANK[r];
+const canEdit = () => roleAtLeast("editor");
+const canAdmin = () => roleAtLeast("admin");
+async function reloadConfig() {
+  try { APP.cfg = await (await fetch("/api/config", { cache: "no-store" })).json(); } catch {}
+  APP.user = APP.cfg.user || null; APP.org = APP.cfg.org || null; APP.orgs = APP.cfg.orgs || []; APP.operator = !!APP.cfg.operator;
+  if (APP.cfg.budget?.over) toast("This organisation has used its monthly AI budget. An admin can raise it in Team & keys.");
+  else if (APP.cfg.budget?.warn) toast(`This organisation has used ${Math.round((APP.cfg.budget.pct || 0) * 100)}% of its monthly AI budget.`);
+}
+// Invite links (#invite=…), password resets (#reset=…) and Google sign-in errors (#auth-error=…).
+async function handleAuthHash() {
+  const h = location.hash;
+  const inv = h.match(/^#invite=([A-Za-z0-9_-]+)/), rst = h.match(/^#reset=([A-Za-z0-9_-]+)/), ae = h.match(/^#auth-error=(.*)$/), ver = h.match(/^#verify=([A-Za-z0-9_-]+)/);
+  if (!inv && !rst && !ae && !ver) return false;
+  history.replaceState(null, "", location.pathname);
+  if (ver) { try { await api("POST", "/api/auth/verify", { token: ver[1] }); await reloadConfig(); toast("Email confirmed. Thanks."); } catch (e) { toast(esc(e.message)); } return false; }
+  if (ae) { showAuth("signin", null); $("#authErr").textContent = decodeURIComponent(ae[1]); return true; }
+  if (rst) { AUTH.reset = rst[1]; showAuth("reset", null); return true; }
+  let info;
+  try { info = await api("GET", "/api/invitations/" + inv[1]); }
+  catch (e) { showAuth("signin", null); $("#authErr").textContent = e.message; return true; }
+  if (APP.user) {
+    if (APP.user.email.toLowerCase() !== info.email.toLowerCase()) {
+      toast(`That invite is for ${esc(info.email)}, and you're signed in as ${esc(APP.user.email)}. Sign out, then open the link again.`);
+      return false;
+    }
+    try { await api("POST", `/api/invitations/${inv[1]}/accept`); await reloadConfig(); await DATA.refresh(); toast(`You're in ${esc(info.org)}.`); } catch (e) { toast(esc(e.message)); }
+    return false;
+  }
+  AUTH.invite = inv[1]; AUTH.inviteInfo = info;
+  showAuth(info.account ? "signin" : "signup", null);
+  return true;
+}
 
 // Signed in: straight to the most recently used brand. Otherwise the landing page.
 async function home() {
@@ -186,15 +241,19 @@ const sparkline = (vals, w = 96, h = 26) => {
 function paintLanding() {
   const signedIn = DATA.server();
   $("#lpAuth").hidden = !APP.cfg.auth || signedIn;
+  $("#lpTeam").hidden = !signedIn;
+  $("#lpTeam").textContent = APP.org ? `${APP.org.name} · Team` : "Team";
   $("#lpUser").innerHTML = signedIn ? `<span class="muted">${esc(APP.user.email)}</span> <button type="button" class="lnk" id="lpOut">Sign out</button>` : "";
+  $("#startForm").hidden = signedIn && !canEdit();
   $("#lpOut")?.addEventListener("click", () => $("#signOut").click());
   $("#signOut").hidden = !signedIn; if (signedIn) $("#whoami").textContent = `Sign out (${APP.user.email})`;
   const avail = (APP.cfg.engines || []).map((e) => ENG[e]).filter(Boolean);
   $("#lpEngines").innerHTML = avail.length ? `<span class="muted">Checks</span> ${avail.map((n) => `<span class="eng-pill">${esc(n)}</span>`).join("")}` : "";
   const list = signedIn ? DATA.companies() : [];
   $("#lpBrands").hidden = !list.length;
-  $("#lpKicker").textContent = signedIn ? (list.length ? "Your brands" : "Add your first brand") : "AI search visibility";
-  $("#lpTitle").innerHTML = signedIn && list.length ? "Add another brand" : "Will AI <em>recommend you?</em>";
+  $("#lpKicker").textContent = signedIn ? (list.length ? `${APP.org?.name || "Your"} brands` : canEdit() ? "Add your first brand" : "No brands yet") : "AI search visibility";
+  $("#lpTitle").innerHTML = signedIn && !canEdit() ? (list.length ? "Your team's brands" : "Nothing to show yet") : signedIn && list.length ? "Add another brand" : "Will AI <em>recommend you?</em>";
+  if (signedIn && !canEdit() && !list.length) { $("#lpSub").hidden = false; $("#lpSub").textContent = "You can view this organisation's brands. When an editor adds one, it appears here."; }
   $("#lpSub").hidden = signedIn && list.length > 0;
   $$(".howto").forEach((h) => (h.hidden = signedIn && list.length > 0));
   if (!list.length) return;
@@ -940,7 +999,7 @@ async function ask(q) {
 }
 
 /* =================================================================== SCREENS */
-const SCREENS = ["landing", "auth", "mission", "onboard", "ready", "reportWrap"];
+const SCREENS = ["landing", "auth", "mission", "onboard", "ready", "reportWrap", "team"];
 function screen(id) {
   SCREENS.forEach((s) => ($("#" + s).hidden = s !== id));
   document.body.classList.add("is-light"); // every screen is light now; the agent console included
@@ -975,6 +1034,8 @@ const ICONS = {
   action: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   out: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/>',
+  team: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.6-3 2.8-4.6 5.5-4.6s4.9 1.6 5.5 4.6"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14.6c2.4-.3 4.3 1 5 3.9"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l3 3M14 9l2 2"/>',
 };
 const icon = (k, s = 16) => `<svg class="ic" viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k] || ""}</svg>`;
 function paintIcons(root = document) { $$("i[data-ic]", root).forEach((el) => { el.outerHTML = icon(el.dataset.ic); }); }
@@ -1547,6 +1608,10 @@ function dashRender() {
   $("#crumb").innerHTML = `<span class="muted">${g}</span>${icon("chev", 13)}<b>${t}</b>`;
   $("#filters").innerHTML = filtersHtml(M);
   $("#filters").hidden = ["actions", "site", "perception", "settings"].includes(DASH.page);
+  $("#rerun").hidden = !canEdit(); $("#newBrand").hidden = DATA.server() && !canEdit();
+  // Hide what this person's role can't do (the server refuses it anyway): viewers change nothing, editors don't connect tools or delete brands.
+  $("#reportWrap").classList.toggle("ro", !canEdit()); $("#reportWrap").classList.toggle("not-admin", !canAdmin());
+  $("#navTeam").hidden = !DATA.server(); if (APP.org) $("#navTeamTxt").textContent = `${APP.org.name} · Team`;
   const m = metrics(M, DASH.eng), pm = prevMetrics(M, DASH.eng);
   $("#pages").innerHTML = `<div class="pg">${(PAGE[DASH.page] || PAGE.overview)(M, m, pm)}</div>`;
   if (DASH.page === "actions") drawDeck();
@@ -1876,7 +1941,10 @@ Object.assign(PAGE, {
     const d = APP.ints[M.slug]; const ints = d?.integrations || [];
     const sched = ws?.schedule || "off", samples = ws?.samples || 1;
     const c = DATA.company(M.slug) || {};
-    return head("Settings", `How White Petal tracks ${esc(M.profile.name)}.`)
+    const moveTo = APP.orgs.filter((o) => o.slug !== APP.org?.slug && ["owner", "admin"].includes(o.role));
+    const roleNote = !canEdit() ? `<div class="card note"><div class="pad">${icon("info", 16)} <b>You're a viewer in ${esc(APP.org?.name || "this organisation")}.</b> <span class="muted">You can see everything here; an editor or admin can change it.</span></div></div>` : "";
+    const moveCard = canAdmin() && moveTo.length ? `<div class="card"><div class="card-h"><b>Move to another organisation</b><span class="muted">Brings its history, prompts and integrations along</span></div><div class="pad set"><div class="srow"><select id="moveOrg" class="sel">${moveTo.map((o) => `<option value="${esc(o.slug)}">${esc(o.name)}</option>`).join("")}</select><button type="button" class="btn ghost sm" data-move>Move ${esc(M.profile.name)}</button></div></div></div>` : "";
+    return head("Settings", `How White Petal tracks ${esc(M.profile.name)}.`) + roleNote
       + `<div class="grid2"><div class="card"><div class="card-h"><b>Automatic checks</b><span class="muted">Runs on the server; you can close the tab</span></div><div class="pad set">
           <div class="srow"><span>Re-run every prompt</span><div class="seg">${[["off", "Off"], ["weekly", "Weekly"], ["daily", "Daily"]].map(([k, l]) => `<button type="button" data-sched="${k}" aria-pressed="${sched === k}">${l}</button>`).join("")}</div></div>
           <div class="srow"><span>Answers per prompt <span class="muted sm">averages out AI's run-to-run variation</span></span><div class="seg">${[1, 2, 3].map((k) => `<button type="button" data-samp="${k}" aria-pressed="${samples === k}">${k}×</button>`).join("")}</div></div>
@@ -1888,7 +1956,8 @@ Object.assign(PAGE, {
           <p class="muted sm">${esc((M.profile.competitors || []).slice(0, 6).join(", "))}</p>
           <div class="srow"><button type="button" class="btn ghost sm" data-editsetup>Edit prompts and competitors</button><button type="button" class="btn ghost sm" id="delBrand" data-del>Delete brand</button></div>
         </div></div></div>
-      <div class="sec-h"><h3>Integrations</h3><p>Connect the free tools, and White Petal pulls their data into every check.</p></div>
+      ${moveCard}
+      <div class="sec-h"><h3>Integrations</h3><p>Connect the free tools, and White Petal pulls their data into every check.${canAdmin() ? "" : " Connecting and disconnecting is for admins."}</p></div>
       <div class="ints">${!d ? '<p class="muted pad">Loading…</p>' : ints.map((i) => intCard(M, i)).join("")}</div>`;
   },
 });
@@ -1919,11 +1988,14 @@ $("#reportWrap").addEventListener("click", async (e) => {
     if (t.closest("#navSettings")) { DASH.page = "settings"; return dashRender(); }
     const sc = t.closest("[data-sched]"); if (sc) { await DATA.patch(slug, { schedule: sc.dataset.sched }); toast(sc.dataset.sched === "off" ? "Automatic checks are off." : `${sc.dataset.sched === "daily" ? "Daily" : "Weekly"} checks are on.`); return dashRender(); }
     const sp = t.closest("[data-samp]"); if (sp) { await DATA.patch(slug, { samples: +sp.dataset.samp }); return dashRender(); }
-    if (t.closest("[data-queue]")) { await DATA.patch(slug, { runNow: true }); toast("Queued. The server picks it up within the hour, and the results appear here."); return dashRender(); }
+    if (t.closest("[data-queue]")) { await DATA.patch(slug, { runNow: true }); toast("Queued. The server starts it within about 10 minutes, so you can close this tab. Results appear here."); return dashRender(); }
     if (t.closest("[data-editsetup]")) { const c = DATA.company(slug); return startOnboarding(M.profile.site, c || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines }); }
     const del = t.closest("[data-del]");
     if (del) { if (del.dataset.armed !== "1") { del.dataset.armed = "1"; del.textContent = "Click again to delete everything"; del.classList.add("danger"); return; } await api("DELETE", `/api/workspaces/${encodeURIComponent(slug)}`); await DATA.refresh(); APP.M = null; toast("Brand deleted."); return home(); }
     const art = t.closest("[data-article]"); if (art) return articleModal(art.dataset.article);
+    const mv = t.closest("[data-move]");
+    if (mv) { const to = $("#moveOrg").value, name = $("#moveOrg").selectedOptions[0]?.textContent; if (mv.dataset.armed !== "1") { mv.dataset.armed = "1"; mv.textContent = `Click again to move it to ${name}`; return; }
+      await api("PATCH", `/api/workspaces/${encodeURIComponent(slug)}`, { moveTo: to }); toast(`${esc(M.profile.name)} moved to ${esc(name)}.`); await switchOrg(to); return; }
     const sq = t.closest("[data-serp]");
     if (sq) { const done = busy(sq, "Checking…"); const q = sq.dataset.serp; M.serp = M.serp || {};
       try { const r = await api("POST", "/api/serp/organic", { query: q, market: M.profile.market }); M.serp[norm(q)] = { results: r.results, at: Date.now() }; }
@@ -2020,6 +2092,132 @@ $("#reportWrap").addEventListener("click", async (e) => {
   dashRender();
 });
 
+/* =================================================================== TEAM
+   The organisation: people and roles, invites, its own AI keys, the monthly budget and usage, the audit log.
+   Operators (the people who run White Petal for clients) also create organisations and can open any of them. */
+const ROLE_LABEL = { owner: "Owner", admin: "Admin", editor: "Editor", viewer: "Viewer" };
+const ROLE_HELP = { admin: "people, keys, integrations, deleting brands", editor: "runs checks, edits prompts, writes drafts", viewer: "sees dashboards and reports, can ask the agent" };
+const TEAM = { d: null, audit: null, adminOrgs: null, lastLink: null };
+const fmtDay = (d) => (d ? new Date(d).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "–");
+const fmtWhen = (d) => (d ? new Date(d).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "–");
+const usd = (v) => (v == null ? "–" : `$${Number(v).toFixed(2)}`);
+async function openTeam(focus) {
+  if (!DATA.server()) return;
+  screen("team"); $("#teamUser").innerHTML = `<span class="muted">${esc(APP.user.email)}</span>`;
+  $("#teamBody").innerHTML = `<p class="muted pad">Loading…</p>`;
+  try {
+    TEAM.d = await api("GET", "/api/org");
+    TEAM.audit = canAdmin() ? (await api("GET", "/api/org/audit")).log : null;
+    TEAM.adminOrgs = APP.operator ? (await api("GET", "/api/admin/orgs")).orgs : null;
+  } catch (e) { $("#teamBody").innerHTML = `<p class="err pad">${esc(e.message)}</p>`; return; }
+  paintTeam();
+  if (focus) setTimeout(() => $(focus)?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+}
+function paintTeam() {
+  const d = TEAM.d, o = d.org, admin = ["owner", "admin"].includes(o.role), owner = o.role === "owner" && !o.operatorVisit;
+  const switcher = APP.orgs.length > 1 || APP.operator ? `<div class="seg team-switch">${APP.orgs.map((x) => `<button type="button" data-org="${esc(x.slug)}" aria-pressed="${x.slug === o.slug}">${esc(x.name)}</button>`).join("")}</div>` : "";
+  const memberRows = d.members.map((m) => {
+    const self = m.id === d.me, editable = admin && m.role !== "owner" && !self;
+    const roleCell = editable ? `<select class="sel" data-role="${esc(m.id)}">${["admin", "editor", "viewer"].map((r) => `<option value="${r}" ${m.role === r ? "selected" : ""}>${ROLE_LABEL[r]}</option>`).join("")}${owner ? `<option value="owner">Make owner…</option>` : ""}</select>` : `<span class="pillx ${m.role === "owner" ? "ok" : ""}">${ROLE_LABEL[m.role]}</span>`;
+    const act = editable ? `<button type="button" class="lnk sm" data-remove="${esc(m.id)}">Remove</button>` : self && m.role !== "owner" ? `<button type="button" class="lnk sm" data-remove="${esc(m.id)}" data-self="1">Leave</button>` : "";
+    return `<tr><td><b>${esc(m.name || m.email.split("@")[0])}</b>${self ? ' <span class="tagx">You</span>' : ""}<div class="muted sm">${esc(m.email)}</div></td><td>${roleCell}</td><td class="muted sm hide-sm">${fmtDay(m.joined_at)}</td><td class="muted sm hide-sm">${m.last_login_at ? fmtDay(m.last_login_at) : "never"}</td><td class="r">${act}</td></tr>`;
+  }).join("");
+  const invites = admin ? `<div class="card" id="teamInvite"><div class="card-h"><b>Invite someone</b><span class="muted">The link works for 7 days, once</span></div><div class="pad set">
+      <form class="team-inv" id="inviteForm"><input class="inp" id="invEmail" type="email" placeholder="name@company.com" required autocomplete="off"><select class="sel" id="invRole">${["editor", "viewer", "admin"].map((r) => `<option value="${r}">${ROLE_LABEL[r]}: ${ROLE_HELP[r]}</option>`).join("")}</select><button class="btn sm" type="submit">Send invite</button></form>
+      ${TEAM.lastLink ? `<div class="team-link"><span class="muted sm">${TEAM.lastLink.emailed ? `Emailed to ${esc(TEAM.lastLink.email)}. You can also share this link:` : `Email isn't set up yet, so share this link with ${esc(TEAM.lastLink.email)} yourself:`}</span><div class="srow"><code class="ell">${esc(TEAM.lastLink.link)}</code><button type="button" class="btn ghost sm" data-copy="${esc(TEAM.lastLink.link)}">Copy link</button></div></div>` : ""}
+      ${d.invites.length ? `<table class="tbl"><thead><tr><th>Waiting for</th><th>Role</th><th>Expires</th><th></th></tr></thead><tbody>${d.invites.map((i) => `<tr><td>${esc(i.email)}<div class="muted sm">invited by ${esc(i.invited_by || "–")}</div></td><td><span class="pillx">${ROLE_LABEL[i.role]}</span></td><td class="muted sm">${fmtDay(i.expires_at)}</td><td class="r"><button type="button" class="lnk sm" data-revoke="${esc(i.id)}">Cancel</button></td></tr>`).join("")}</tbody></table>` : ""}
+    </div></div>` : "";
+  const keys = d.keys ? `<div class="card" id="teamKeys"><div class="card-h">${icon("key", 15)}<b>AI keys</b><span class="muted">${o.allowPlatformKeys ? "Keys you add here are used first; the rest fall back to White Petal's" : "Checks run on these keys only, so the spend is on your accounts"}</span></div><div class="pad set">
+      <table class="tbl"><thead><tr><th>Service</th><th>Status</th><th>New value</th><th></th></tr></thead><tbody>${d.keys.map((k) => `<tr><td><b>${esc(k.label)}</b><div class="muted sm"><code>${esc(k.name)}</code></div></td><td>${k.set ? `<span class="pillx ok">Set ${esc(k.hint)}</span>` : k.platform ? `<span class="pillx">Using White Petal's</span>` : `<span class="pillx no">Not set</span>`}</td><td><input class="inp" type="password" autocomplete="off" data-key="${esc(k.name)}" placeholder="${k.set ? "Paste to replace" : "Paste key"}"></td><td class="r">${k.set ? `<button type="button" class="lnk sm" data-clearkey="${esc(k.name)}">Remove</button>` : ""}</td></tr>`).join("")}</tbody></table>
+      <div class="srow"><span class="muted sm">Keys are encrypted at rest and never shown again in full. ChatGPT needs OpenAI; Gemini is free at aistudio.google.com/apikey.</span><button type="button" class="btn sm" data-savekeys>Save keys</button></div>
+    </div></div>` : "";
+  const u = d.usage || {}, cap = u.cap || {};
+  const meter = cap.cap ? `<div class="meter ${cap.over ? "over" : cap.warn ? "warn" : ""}"><i style="width:${Math.round((cap.pct || 0) * 100)}%"></i></div><p class="muted sm">${usd(cap.spent)} of ${usd(cap.cap)} this month${cap.over ? " · budget reached: new checks are paused until next month or a higher budget" : cap.warn ? " · over 80%" : ""}</p>` : `<p class="muted sm">${usd(cap.spent)} this month · no monthly limit set</p>`;
+  const usageTbl = (rows, label) => rows?.length ? `<table class="tbl"><thead><tr><th>${label}</th><th class="r">Calls</th><th class="r">Est. cost</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(ENG[r.name] || r.name)}</td><td class="r">${r.calls.toLocaleString()}</td><td class="r">${usd(r.usd)}</td></tr>`).join("")}</tbody></table>` : "";
+  const budget = admin ? `<div class="card" id="teamBudget"><div class="card-h"><b>Budget and usage</b><span class="muted">Estimated from list prices; your providers' bills are the real numbers</span></div><div class="pad set">
+      ${meter}
+      <div class="srow"><span>Monthly AI budget (USD)</span><span class="team-cap"><input class="inp" id="capIn" type="number" min="0" step="1" placeholder="No limit" value="${o.monthlyCapUsd ?? ""}"><button type="button" class="btn ghost sm" data-savecap>Save</button></span></div>
+      <div class="grid2">${usageTbl(u.byEngine, "Engine or task")}${usageTbl(u.byPerson, "Person")}</div>${usageTbl(u.byBrand, "Brand")}
+    </div></div>` : `<div class="card"><div class="card-h"><b>Budget</b></div><div class="pad set">${cap.cap ? meter : `<p class="muted sm">No monthly limit set.</p>`}</div></div>`;
+  const audit = TEAM.audit ? `<div class="card"><div class="card-h"><b>Activity</b><span class="muted">Who changed what</span></div><table class="tbl"><thead><tr><th>When</th><th>Who</th><th>What</th></tr></thead><tbody>${TEAM.audit.slice(0, 60).map((a) => `<tr><td class="muted sm">${fmtWhen(a.at)}</td><td class="sm">${esc(a.who || "White Petal")}</td><td class="sm">${esc(auditWords(a))}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">Nothing yet.</td></tr>`}</tbody></table></div>` : "";
+  const ops = TEAM.adminOrgs ? `<div class="card" id="teamOps"><div class="card-h"><b>All organisations</b><span class="muted">Only White Petal operators see this</span></div><div class="pad set">
+      <form class="team-inv" id="newOrgForm"><input class="inp" id="newOrgName" placeholder="Client name, e.g. AI Xccelerate" required><input class="inp" id="newOrgOwner" type="email" placeholder="Owner's email (they get an invite)"><button class="btn sm" type="submit">Create organisation</button></form>
+      <table class="tbl"><thead><tr><th>Organisation</th><th>Owner</th><th class="r">People</th><th class="r">Brands</th><th class="r">This month</th><th></th></tr></thead><tbody>${TEAM.adminOrgs.map((x) => `<tr><td><b>${esc(x.name)}</b><div class="muted sm">${esc(x.slug)}${x.allow_platform_keys ? " · platform keys" : ""}</div></td><td class="sm">${esc(x.owner || "invite pending")}</td><td class="r">${x.members}</td><td class="r">${x.brands}</td><td class="r">${usd(x.spent)}</td><td class="r">${x.slug === o.slug ? '<span class="tagx">Open</span>' : `<button type="button" class="lnk sm" data-org="${esc(x.slug)}">Open</button>`}</td></tr>`).join("")}</tbody></table>
+    </div></div>` : "";
+  const verify = APP.user && !APP.user.verified ? `<div class="card note"><div class="pad">${icon("info", 16)} <b>Confirm your email.</b> <span class="muted">We sent a link to ${esc(APP.user.email)} when you signed up. Some things, like operator access, wait for it.</span><button type="button" class="btn ghost sm" data-sendverify>Send it again</button></div></div>` : "";
+  $("#teamBody").innerHTML = verify + `<div class="team-head"><div><span class="lp-kicker">Organisation</span><h1>${esc(o.name)}</h1><p class="muted">You're ${o.operatorVisit ? "visiting as a White Petal operator (logged)" : `${{ owner: "the owner", admin: "an admin", editor: "an editor", viewer: "a viewer" }[o.role]}`} · ${d.members.length} ${d.members.length === 1 ? "person" : "people"}</p></div>${switcher}</div>
+    <div class="card"><div class="card-h">${icon("team", 15)}<b>People</b><span class="muted">Owner and admins manage people and keys; editors do the work; viewers watch</span></div><table class="tbl"><thead><tr><th>Person</th><th>Role</th><th class="hide-sm">Joined</th><th class="hide-sm">Last sign-in</th><th></th></tr></thead><tbody>${memberRows}</tbody></table></div>
+    ${invites}${keys}${budget}${audit}${ops}`;
+}
+const AUDIT_WORDS = { "org.created": "created the organisation", "invite.sent": "invited", "invite.accepted": "joined", "invite.revoked": "cancelled the invite for", "role.changed": "changed the role of", "owner.transferred": "handed ownership to", "member.removed": "removed", "member.left": "left", "keys.changed": "changed AI keys:", "org.updated": "changed settings", "brand.deleted": "deleted the brand", "brand.moved_in": "moved in the brand", "brand.moved_out": "moved out the brand", "integration.saved": "connected", "integration.removed": "disconnected", "check.queued": "queued a check of", "check.skipped": "skipped a scheduled check of", "operator.visit": "opened the organisation as an operator" };
+function auditWords(a) {
+  const d = a.detail || {};
+  const extra = a.action === "role.changed" ? ` (${ROLE_LABEL[d.from] || d.from} → ${ROLE_LABEL[d.to] || d.to})` : a.action === "invite.sent" || a.action === "invite.accepted" ? ` as ${ROLE_LABEL[d.role] || d.role || ""}` : a.action === "check.skipped" ? ": monthly budget reached" : a.action === "org.updated" ? `: ${Object.keys(d).join(", ").replace("monthly_cap_usd", "monthly budget")}` : "";
+  return [AUDIT_WORDS[a.action] || a.action, a.action === "operator.visit" ? "" : a.target || ""].filter(Boolean).join(" ") + extra;
+}
+async function switchOrg(slug) {
+  await api("POST", `/api/orgs/${encodeURIComponent(slug)}/switch`);
+  await reloadConfig(); APP.M = null; await DATA.refresh();
+  toast(`Now in ${esc(APP.org?.name || slug)}.`);
+  return home();
+}
+$("#team").addEventListener("click", async (e) => {
+  const t = e.target;
+  try {
+    const org = t.closest("[data-org]"); if (org) return switchOrg(org.dataset.org);
+    if (t.closest("[data-sendverify]")) { const r = await api("POST", "/api/auth/verify/send"); return toast(r.already ? "Your email is already confirmed." : r.emailed ? `Sent to ${esc(APP.user.email)}.` : "Email isn't set up on this server yet, so the link is in the server log."); }
+    const cp = t.closest("[data-copy]"); if (cp) { await navigator.clipboard.writeText(cp.dataset.copy).catch(() => {}); return toast("Link copied."); }
+    const rv = t.closest("[data-revoke]"); if (rv) { TEAM.d.invites = (await api("DELETE", `/api/org/invitations/${rv.dataset.revoke}`)).invites; return paintTeam(); }
+    const rm = t.closest("[data-remove]");
+    if (rm) {
+      if (rm.dataset.armed !== "1") { rm.dataset.armed = "1"; rm.textContent = rm.dataset.self ? "Click again to leave" : "Click again to remove"; return; }
+      const r = await api("DELETE", `/api/org/members/${rm.dataset.remove}`);
+      if (r.left) { await reloadConfig(); await DATA.refresh(); toast("You left the organisation."); return home(); }
+      TEAM.d.members = r.members; return paintTeam();
+    }
+    const ck = t.closest("[data-clearkey]"); if (ck) { TEAM.d.keys = (await api("PUT", "/api/org/keys", { keys: { [ck.dataset.clearkey]: null } })).keys; await reloadConfig(); toast("Key removed."); return paintTeam(); }
+    if (t.closest("[data-savekeys]")) {
+      const keys = {}; $$("#teamKeys [data-key]").forEach((i) => { if (i.value.trim()) keys[i.dataset.key] = i.value.trim(); });
+      if (!Object.keys(keys).length) return toast("Paste at least one key first.");
+      const r = await api("PUT", "/api/org/keys", { keys }); TEAM.d.keys = r.keys; await reloadConfig();
+      toast(`Saved. Engines now available: ${(APP.cfg.engines || []).map((x) => ENG[x]).join(", ") || "none"}.`); return paintTeam();
+    }
+    if (t.closest("[data-savecap]")) { const v = $("#capIn").value.trim(); await api("PATCH", "/api/org", { monthlyCapUsd: v === "" ? null : Number(v) }); toast(v === "" ? "No monthly limit." : `Monthly budget set to $${v}.`); return openTeam(); }
+  } catch (err) { toast(esc(err.message)); }
+});
+$("#team").addEventListener("change", async (e) => {
+  const sel = e.target.closest("[data-role]"); if (!sel) return;
+  const to = sel.value, m = TEAM.d.members.find((x) => x.id === sel.dataset.role);
+  if (to === "owner" && !confirmOwner(m)) { sel.value = m.role; return; }
+  try { TEAM.d.members = (await api("PATCH", `/api/org/members/${sel.dataset.role}`, { role: to })).members; if (to === "owner") { await reloadConfig(); return openTeam(); } toast(`${esc(m.email)} is now ${ROLE_LABEL[to].toLowerCase()}.`); paintTeam(); }
+  catch (err) { toast(esc(err.message)); sel.value = m.role; }
+});
+// Handing over ownership is the one change that takes power away from the person making it: ask twice.
+function confirmOwner(m) { const ok = TEAM.ownerArmed === m.id; TEAM.ownerArmed = ok ? null : m.id; if (!ok) toast(`Choose “Make owner…” again to hand ownership to ${esc(m.email)}. You'll stay on as an admin.`); return ok; }
+$("#team").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    if (e.target.id === "inviteForm") {
+      const r = await api("POST", "/api/org/invitations", { email: $("#invEmail").value, role: $("#invRole").value });
+      TEAM.lastLink = { link: r.invite.link, email: r.invite.email, emailed: r.invite.emailed }; TEAM.d.invites = r.invites;
+      TEAM.audit = (await api("GET", "/api/org/audit")).log; paintTeam();
+      return toast(r.invite.emailed ? `Invite emailed to ${esc(r.invite.email)}.` : "Invite created. Copy the link and send it.");
+    }
+    if (e.target.id === "newOrgForm") {
+      const r = await api("POST", "/api/orgs", { name: $("#newOrgName").value, ownerEmail: $("#newOrgOwner").value || undefined });
+      TEAM.lastLink = r.invite ? { link: r.invite.link, email: r.invite.email, emailed: r.invite.emailed } : null;
+      await reloadConfig(); await DATA.refresh(); toast(`${esc(r.created.name)} created. You're in it now.`); return openTeam(r.invite ? "#teamInvite" : null);
+    }
+  } catch (err) { toast(esc(err.message)); }
+});
+$("#teamBack").addEventListener("click", () => home());
+$("#lpTeam").addEventListener("click", () => openTeam());
+$("#navTeam").addEventListener("click", () => openTeam());
+document.addEventListener("click", (e) => { if (e.target.id === "toTeamKeys") openTeam("#teamKeys"); });
+
+// A link opened in a tab that already has the app (same page, new #hash): handle it without a reload.
+addEventListener("hashchange", async () => { if (/^#(invite|reset|verify|auth-error)=/.test(location.hash) && !(await handleAuthHash())) home(); });
+
 /* =================================================================== LEAVING & COMING BACK */
 // No "leave site?" prompt: the run is saved continuously and this tab picks it back up by itself when you return.
 const AUTO = "wpetal:auto";
@@ -2042,12 +2240,13 @@ document.addEventListener("visibilitychange", () => {
 (async () => {
   paintIcons();
   $$(".wordmark .pq").forEach((m) => m.classList.add("anim"));
-  try { APP.cfg = await (await fetch("/api/config", { cache: "no-store" })).json(); } catch { $("#startErr").textContent = "Can't reach the server."; }
-  APP.user = APP.cfg.user || null;
+  try { const r = await fetch("/api/config", { cache: "no-store" }); if (!r.ok) throw 0; } catch { $("#startErr").textContent = "Can't reach the server."; }
+  await reloadConfig();
   if (APP.cfg.access) { $("#accessRow").hidden = false; $("#accessCode").value = APP.code || ""; }
   paintLanding();
   if (DATA.server()) { try { await DATA.refresh(); } catch {} }
-  if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").textContent = "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
+  if (await handleAuthHash()) return;
+  if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").innerHTML = DATA.server() ? (canAdmin() ? `This organisation has no AI keys yet. Add them in <button type="button" class="lnk" id="toTeamKeys">Team &amp; keys</button>.` : "This organisation has no AI keys yet. Ask an admin to add them in Team & keys.") : "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
   // This tab was running a check when it navigated away or reloaded: carry on without asking.
   let auto = null; try { auto = sessionStorage.getItem(AUTO); sessionStorage.removeItem(AUTO); } catch {}
   const m = auto && store.get("mission:" + auto, null);

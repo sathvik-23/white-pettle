@@ -14,7 +14,7 @@ Browser ──HTTPS──▶ Cloud Run `whitepetal`  (min 0, max 3, 1 vCPU / 512
                      ├─ boot: reads WHITEPETAL_* from Secret Manager (runtime SA, per-secret grants)
                      └─ outbound HTTPS to OpenAI / Perplexity / Gemini / …  (no VPC, no NAT)
 
-Cloud Scheduler (hourly) ──POST /api/cron/tick + x-cron-secret──▶ Cloud Run
+Cloud Scheduler (every 10 min) ──POST /api/cron/tick + x-cron-secret──▶ Cloud Run
 ```
 
 ## First run
@@ -48,7 +48,7 @@ terraform apply                      # read the plan: it is PerfStaq's project
 | `secrets.tf` | 15 `WHITEPETAL_*` secret containers, per-secret accessor grants, versions for `DATABASE_URL`, `APP_SECRET`, `CRON_SECRET` | provider keys are added by hand (`infra/secrets.sh`) |
 | `registry.tf` | Artifact Registry `whitepetal` | keeps 5 newest; deletes untagged > 7 d and anything else > 30 d; scanning off |
 | `run.tf` | runtime SA, Cloud Run `whitepetal`, optional domain mapping | scale-to-zero, request-based billing, gen2, Cloud SQL socket volume |
-| `scheduler.tf` | job `whitepetal-cron-tick` | hourly, 30-min deadline, no retries |
+| `scheduler.tf` | job `whitepetal-cron-tick` | every 10 minutes, 30-min deadline, no retries |
 | `github.tf` | WIF provider `github-whitepetal` in the existing pool, `whitepetal-deployer` | every grant scoped to a White Petal resource |
 | `budget.tf` | budget "whitepetal — infra guard" | label `app=whitepetal`, gross of the trial credit |
 | `logging.tf` | log exclusion | drops successful static-asset request logs |

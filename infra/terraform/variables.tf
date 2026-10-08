@@ -78,9 +78,9 @@ variable "max_instances" {
 }
 
 variable "cron_schedule" {
-  description = "When Cloud Scheduler POSTs /api/cron/tick (unix-cron, UTC). Hourly; the app decides which brand checks are due."
+  description = "When Cloud Scheduler POSTs /api/cron/tick (unix-cron, UTC). Every 10 minutes, so a check someone queues starts soon after; the app decides which brand checks are due. A tick with nothing due is a ~2 s cold start (about 4,300 a month, inside Cloud Run's free tier)."
   type        = string
-  default     = "0 * * * *"
+  default     = "*/10 * * * *"
 }
 
 # Budget alarm, in the billing account's currency (INR). The design target is
@@ -105,4 +105,16 @@ variable "exclude_static_request_logs" {
   EOT
   type        = bool
   default     = true
+}
+
+variable "platform_operators" {
+  description = "Comma-separated emails of the people who run White Petal: they can create organisations for clients and open any organisation (logged in its audit log)."
+  type        = string
+  default     = ""
+}
+
+variable "email_from" {
+  description = "Sender for invite and password-reset emails (Resend). The domain must be verified in Resend."
+  type        = string
+  default     = "White Petal <no-reply@whitepetal.perfstaq.com>"
 }

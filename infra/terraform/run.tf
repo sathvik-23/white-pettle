@@ -174,6 +174,16 @@ resource "google_cloud_run_v2_service" "whitepetal" {
         value = local.public_origin
       }
 
+      env {
+        name  = "PLATFORM_OPERATORS"
+        value = var.platform_operators
+      }
+
+      env {
+        name  = "EMAIL_FROM"
+        value = var.email_from
+      }
+
       # No PORT: Cloud Run reserves it, injects 8080, and rejects a service
       # that sets it.
 

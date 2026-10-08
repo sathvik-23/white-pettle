@@ -893,3 +893,33 @@ code{font-family:var(--f-mono);font-size:.82em;background:var(--bg2);padding:1px
 /* landing header spans the page: logo left, account right */
 #landing>.ob-top{position:absolute;top:0;left:0;right:0;box-sizing:border-box}
 @media (max-width:560px){#landing .lp-user .muted{display:none}}
+
+/* ── organisations: sign-in extras and the Team & keys screen ── */
+.auth-invite{background:var(--petal-wash);border-radius:10px;padding:10px 12px;font-size:.9rem;text-align:left;line-height:1.45}
+.auth-google{width:100%;box-sizing:border-box;padding:11px!important}
+.auth-or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.8rem}
+.auth-or::before,.auth-or::after{content:"";flex:1;height:1px;background:var(--line)}
+.ok-msg{color:var(--good);font-size:.88rem}.ok-msg:empty,.err:empty{display:none}
+.team-wrap{flex:1;width:100%;max-width:1040px;margin:0 auto;padding:24px 16px 48px;display:flex;flex-direction:column;gap:16px;box-sizing:border-box}
+.team-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.team-head h1{font-size:clamp(1.6rem,4vw,2.2rem);font-weight:600;letter-spacing:-.03em;margin:8px 0 2px}
+.team-switch{flex-wrap:wrap;max-width:100%}
+.team-switch button{white-space:nowrap}
+.team-inv{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.team-inv .inp{flex:1 1 220px}.team-inv .sel{flex:1 1 220px}
+.team-link{display:flex;flex-direction:column;gap:6px;background:#FAFAF9;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.team-link code{font-size:.78rem;word-break:break-all;flex:1;min-width:0}
+.team-cap{display:flex!important;flex-direction:row!important;gap:8px;align-items:center}.team-cap .inp{width:120px}
+.inp,.sel{border:1px solid var(--line2);border-radius:9px;padding:8px 10px;font:inherit;font-size:.88rem;background:#fff;color:var(--ink);min-width:0;box-sizing:border-box}
+.inp:focus,.sel:focus{outline:none;border-color:#151516;box-shadow:0 0 0 3px rgba(17,17,17,.08)}
+.tbl .inp{width:100%;max-width:260px}
+.meter{height:8px;border-radius:8px;background:var(--panel2);overflow:hidden}
+.meter i{display:block;height:100%;background:var(--good);border-radius:8px;transition:width .4s}
+.meter.warn i{background:var(--warn)}.meter.over i{background:var(--rival)}
+#team .card{overflow-x:auto}
+@media (max-width:640px){#team .hide-sm{display:none}.team-head{align-items:flex-start}.tbl th,.tbl td{padding:8px 10px}}
+
+/* role-aware dashboard: viewers read, editors don't connect tools or delete brands */
+.ro [data-sched],.ro [data-samp],.ro [data-queue],.ro [data-editsetup],.ro [data-refresh],.ro [data-submit],.ro [data-serp],.ro [data-article]{display:none!important}
+.not-admin [data-del],.not-admin [data-save],.not-admin [data-disconnect],.not-admin .icard input,.not-admin .icard .af,.not-admin [data-move]{display:none!important}
+.ro .seg{pointer-events:none;opacity:.6}

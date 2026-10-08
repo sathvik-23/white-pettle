@@ -1,5 +1,12 @@
 // Shared helpers for White Petal API routes. Run by server/index.mjs (Cloud Run and local dev), in-process by server/runner.mjs.
-export const env = (k, d = "") => (globalThis.process?.env?.[k] ?? d);
+// Inside a request for an organisation, the server (server/orgs.mjs withEnv) supplies that organisation's own keys:
+// an override object that answers for every AI key name, so a missing key stays missing rather than falling back
+// to the platform's. Everything else (models, flags) still comes from the environment.
+export const env = (k, d = "") => {
+  const o = globalThis.__wpEnvOverride?.();
+  if (o && Object.prototype.hasOwnProperty.call(o, k)) return o[k] || d;
+  return globalThis.process?.env?.[k] ?? d;
+};
 
 export const ENGINE_MODEL = () => env("PETTLE_OPENAI_MODEL", "gpt-5.5");
 export const LLM_MODEL = () => env("PETTLE_LLM_MODEL", "gpt-4.1");
@@ -39,12 +46,16 @@ async function geminiCall(prompt, { stream = false, max = 4000, onDelta } = {}) 
   throw last || new Error("No Gemini model available");
 }
 // Groq's model list changes often, so pick from what this key can actually use.
-let GROQ_IDS = null;
+// Cached per key (organisations bring their own), and a failed lookup is not cached.
+const GROQ_IDS = new Map();
 export async function groqModels() {
-  if (GROQ_IDS) return GROQ_IDS;
-  try { const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { authorization: `Bearer ${env("GROQ_API_KEY")}` } }); const d = await r.json(); GROQ_IDS = (d.data || []).filter((m) => m.active !== false).map((m) => m.id); }
-  catch { GROQ_IDS = []; }
-  return GROQ_IDS;
+  const key = env("GROQ_API_KEY"); if (GROQ_IDS.has(key)) return GROQ_IDS.get(key);
+  try {
+    const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { authorization: `Bearer ${key}` } }); const d = await r.json();
+    const ids = (d.data || []).filter((m) => m.active !== false).map((m) => m.id);
+    if (r.ok && ids.length) GROQ_IDS.set(key, ids);
+    return ids;
+  } catch { return []; }
 }
 export async function pickGroq(prefs, filter, skip = []) {
   const ids = await groqModels();

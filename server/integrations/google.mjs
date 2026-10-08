@@ -68,6 +68,20 @@ export async function exchangeCode({ clientId, clientSecret, redirectUri, code, 
   return { accessToken: d.access_token, refreshToken: d.refresh_token || null, expiresAt: Date.now() + (d.expires_in || 3600) * 1000, email: emailFromIdToken(d.id_token), scope: d.scope || "" };
 }
 
+// "Sign in with Google": identity only (openid email profile), no offline access, separate from the Search Console
+// connection above. The claims come from the id_token Google's token endpoint returned over TLS.
+export function loginUrl({ clientId, redirectUri, state }) {
+  const q = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: "openid email profile", prompt: "select_account", state });
+  return `${AUTH_URL}?${q}`;
+}
+export async function exchangeLogin({ clientId, clientSecret, redirectUri, code, fetch: f }) {
+  const d = await tokenCall({ fetch: f }, { code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: "authorization_code" });
+  let c = {};
+  try { c = JSON.parse(Buffer.from(String(d.id_token).split(".")[1], "base64url").toString("utf8")); } catch {}
+  if (!c.sub || !c.email) throw new Error("Google didn't return an email for this account.");
+  return { sub: String(c.sub), email: String(c.email).toLowerCase(), emailVerified: c.email_verified === true || c.email_verified === "true", name: c.name || null };
+}
+
 const toMs = (v) => (v == null || v === "" ? 0 : typeof v === "number" ? v : /^\d+$/.test(v) ? +v : Date.parse(v) || 0);
 
 // Refresh if missing or expiring within 2 minutes. Mutates cfg with the new token and calls ctx.onToken (caller persists).

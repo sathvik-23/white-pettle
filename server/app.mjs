@@ -8,12 +8,14 @@ import { pathToFileURL } from "node:url";
 import { ROOT } from "./env.mjs";
 
 import { connect, migrate, ping, hasDb, close } from "./db.mjs";
-import { ROUTES, gate, currentUser, isLocalDev } from "./routes.mjs";
-import { HttpError, sendJson } from "./http.mjs";
+import { ROUTES, aiAuth, aiAllow, currentUser, isLocalDev } from "./routes.mjs";
+import * as O from "./orgs.mjs";
+import { HttpError, sendJson, readBody, fail } from "./http.mjs";
+import { limited } from "./security.mjs";
 
-// The original AI handlers. They spend money, so the server gates them: a signed-in user (with a database), or
-// the access code (without one). They also run their own ACCESS_CODE guard, so a gated request is handed the
-// code on the way in rather than making the browser know it.
+// The original AI handlers. They spend money, so the server gates them: an editor in an organisation, inside its
+// monthly budget (with a database), or the access code (without one). They also run their own ACCESS_CODE guard,
+// so a gated request is handed the code on the way in rather than making the browser know it.
 const AI = new Set(["ask", "site", "write", "inspect", "config"]);
 const handlers = {};
 async function aiHandler(name) { return (handlers[name] ||= (await import(pathToFileURL(path.join(ROOT, "api", name + ".js")).href)).default); }
@@ -53,22 +55,44 @@ function serveStatic(req, res, pathname) {
 }
 
 async function handleAi(req, res, name, url) {
-  if (name !== "config") { await gate(req); }
-  const chunks = []; for await (const c of req) chunks.push(c);
-  const headers = { ...req.headers }; if (process.env.ACCESS_CODE && name !== "config") headers["x-access-code"] = process.env.ACCESS_CODE;
-  const request = new Request(url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : Buffer.concat(chunks) });
-  const out = await (await aiHandler(name))(request);
-  if (name === "config") { // the browser's view of what this server can do
-    const cfg = await out.json(); const user = hasDb() ? await currentUser(req) : null;
-    return sendJson(res, 200, { ...cfg, db: hasDb(), auth: hasDb(), access: hasDb() || isLocalDev(req) ? false : cfg.access, invite: hasDb() && !!process.env.ACCESS_CODE, user: user ? { email: user.email, name: user.name } : null,
-      serp: cfg.engines.includes("aio"), googleOAuth: !!process.env.GOOGLE_OAUTH_CLIENT_ID, version: process.env.K_REVISION || "dev" });
-  }
-  res.writeHead(out.status, Object.fromEntries(out.headers));
-  if (!out.body) return res.end();
-  const reader = out.body.getReader();
-  req.on("close", () => reader.cancel().catch(() => {})); // the browser left: stop paying for the stream
-  for (;;) { const { value, done } = await reader.read(); if (done) break; res.write(value); }
-  res.end();
+  if (name === "config") return sendConfig(req, res, url);
+  // Who is asking comes first, before reading a body that could be large; then a size limit.
+  const who = await aiAuth(req);
+  const raw = await readBody(req, 2 * 1024 * 1024);
+  let body = {}; try { body = raw.length ? JSON.parse(raw.toString("utf8")) : {}; } catch {}
+  // Viewers may ask the agent about a run (rate limited); everything else that calls AI needs an editor.
+  const chat = name === "write" && body.kind === "chat";
+  if (who && chat && !O.can(who.role, "editor") && limited("chat:" + who.user.id, 40, 3600e3)) fail(429, "That's a lot of questions for one hour. Try again a bit later.");
+  const ctx = await aiAllow(who, req, chat ? "viewer" : "editor");
+  const run = async () => {
+    if (ctx) O.meter({ orgId: ctx.org.id, workspaceId: ctx.workspaceId, userId: ctx.user.id, kind: name, engine: name === "ask" ? String(body.engine || "") || null : null, bytes: raw.length });
+    const headers = { ...req.headers }; if (process.env.ACCESS_CODE) headers["x-access-code"] = process.env.ACCESS_CODE;
+    const request = new Request(url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : raw });
+    const out = await (await aiHandler(name))(request);
+    res.writeHead(out.status, Object.fromEntries(out.headers));
+    if (!out.body) return res.end();
+    const reader = out.body.getReader();
+    req.on("close", () => reader.cancel().catch(() => {})); // the browser left: stop paying for the stream
+    for (;;) { const { value, done } = await reader.read(); if (done) break; res.write(value); }
+    res.end();
+  };
+  // Inside an organisation the engines run on its own keys (server/orgs.mjs withEnv).
+  return ctx ? O.withOrgKeys(ctx.org.id, run) : run();
+}
+
+// The browser's view of what this server can do, for the signed-in person in their current organisation.
+async function sendConfig(req, res, url) {
+  const user = hasDb() ? await currentUser(req) : null;
+  const ctx = user ? await O.context(user) : null;
+  const get = async () => (await (await aiHandler("config"))(new Request(url))).json();
+  const cfg = ctx?.org ? await O.withOrgKeys(ctx.org.id, get) : await get();
+  const budget = ctx?.org ? await O.capState(ctx.org.id) : null;
+  return sendJson(res, 200, { ...cfg, db: hasDb(), auth: hasDb(), access: hasDb() || isLocalDev(req) ? false : cfg.access, invite: hasDb() && !!process.env.ACCESS_CODE,
+    user: user ? { id: user.id, email: user.email, name: user.name, verified: !!user.email_verified_at } : null,
+    org: ctx ? O.orgOut(ctx) : null, orgs: ctx ? ctx.orgs.map((o) => ({ slug: o.slug, name: o.name, role: o.role })) : [], operator: !!ctx?.operator,
+    budget: budget ? { warn: budget.warn, over: budget.over, pct: budget.pct } : null,
+    googleLogin: hasDb() && !!(process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET),
+    serp: cfg.engines.includes("aio"), googleOAuth: !!process.env.GOOGLE_OAUTH_CLIENT_ID, version: process.env.K_REVISION || "dev" });
 }
 
 export async function start({ port = Number(process.env.PORT || 3000), quiet = false } = {}) {
@@ -97,7 +121,8 @@ const server = http.createServer(async (req, res) => {
     return serveStatic(req, res, url.pathname);
   } catch (e) {
     if (res.headersSent) { try { res.end(); } catch {} return; }
-    if (e instanceof HttpError) return sendJson(res, e.status, { error: e.message, ...(e.extra || {}) });
+    // A refused body may still be arriving: close the connection rather than read the rest as the next request.
+    if (e instanceof HttpError) return sendJson(res, e.status, { error: e.message, ...(e.extra || {}) }, e.status === 413 ? { connection: "close" } : {});
     console.error(`[${req.method} ${url.pathname}]`, e);
     return sendJson(res, 500, { error: String(e.message || "Something went wrong").slice(0, 300) });
   }

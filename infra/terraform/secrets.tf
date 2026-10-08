@@ -50,6 +50,7 @@ locals {
     "DATAFORSEO_PASSWORD",
     "SERPAPI_KEY",
     "ACCESS_CODE",
+    "RESEND_API_KEY",
   ])
 
   # node-postgres reads a Unix socket from `?host=/cloudsql/<connection>`

@@ -46,7 +46,8 @@ export function digest(M) {
 
 /**
  * Run one check for a workspace's saved setup. Returns the run object (same shape the browser saves).
- * opts: { prev (last finished run, for drafts to carry forward), samples, deadline (ms epoch), log }
+ * opts: { prev (last finished run, for drafts to carry forward), samples, deadline (ms epoch), log,
+ *         budgetUsd (stop starting AI calls once their estimated cost would pass it), costOf(kind, engine) }
  */
 export async function runCheck(ws, opts = {}) {
   const setup = ws.setup || {}, log = opts.log || (() => {});
@@ -59,6 +60,9 @@ export async function runCheck(ws, opts = {}) {
   const samples = Math.max(1, Math.min(5, Number(opts.samples || ws.samples || 1)));
   const deadline = opts.deadline || Date.now() + 25 * 60 * 1000;
   const prev = opts.prev || null;
+  // The organisation's remaining monthly budget: each call is checked against it before it starts.
+  let spent = 0; const budget = opts.budgetUsd == null ? null : Number(opts.budgetUsd);
+  const afford = (kind, engine) => { if (budget == null) return true; const c = opts.costOf ? opts.costOf(kind, engine) : 0; if (spent + c > budget) { M.budgetStopped = true; return false; } spent += c; return true; };
   const M = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), slug: ws.slug, source: "scheduled", startedAt: Date.now(), finishedAt: null,
     profile, audit: setup.audit || {}, siteText: setup.siteText || "", engines, samples,
     questions: qs.map((q, i) => ({ id: "q" + (i + 1), intent: q.intent, topic: q.topic, persona: q.persona, text: q.text })),
@@ -68,7 +72,7 @@ export async function runCheck(ws, opts = {}) {
   const jobs = []; for (const q of M.questions) for (const e of engines) for (let s = 0; s < samples; s++) jobs.push([q, e, s]);
   log(`asking ${jobs.length} conversations`);
   await pool(jobs, 3, async ([q, e, s]) => {
-    if (Date.now() > deadline) return;
+    if (Date.now() > deadline || !afford("ask", e)) return;
     const a = { qid: q.id, engine: e, sample: s, status: "run", answer: "", sources: [], brands: [], searches: [] };
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -103,7 +107,7 @@ export async function runCheck(ws, opts = {}) {
   for (const a of answered) for (const s of a.sources || []) { const k = s.url; (cites[k] = cites[k] || { url: k, n: 0, qs: new Set(), cited: false }); cites[k].n++; cites[k].qs.add(a.qid); cites[k].cited ||= s.cited; }
   const targets = Object.values(cites).sort((a, b) => b.n - a.n || (b.cited ? 1 : 0) - (a.cited ? 1 : 0)).slice(0, Number(process.env.RUNNER_PAGES || 18));
   await pool(targets, 4, async (t) => {
-    if (Date.now() > deadline) return;
+    if (Date.now() > deadline || !afford("inspect")) return;
     let r; try { r = await (await call(inspect, { url: t.url, brand: profile })).json(); } catch (e) { r = { ok: false, url: t.url, reason: e.message }; }
     r.n = t.n; r.qs = [...t.qs]; M.inspections[t.url] = r;
   });
@@ -123,7 +127,7 @@ export async function runCheck(ws, opts = {}) {
   if (Date.now() < deadline) { try { M.insights = await writeText("insights", { profile, digest: digest(M) }); } catch (e) { log("insights skipped: " + e.message); } }
   M.done.insights = true; M.done.draft = true; // drafts carry forward from the last run; new ones are written on demand in the app
   M.finishedAt = Date.now();
-  M.partial = Date.now() > deadline;
+  M.partial = Date.now() > deadline || !!M.budgetStopped;
   return M;
 }
 
