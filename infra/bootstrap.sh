@@ -31,7 +31,10 @@ set -euo pipefail
 PROJECT="global-bridge-508618-u6"
 REGION="us-central1"
 SERVICE="whitepetal"
-GITHUB_REPO="sathvik-23/white-pettle"
+# The repository allowed to deploy: terraform.tfvars `github_repo` when set
+# (infra/move-repo.sh writes it), else the Terraform default.
+GITHUB_REPO="$(sed -n -E 's/^[[:space:]]*github_repo[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$(cd "$(dirname "$0")" && pwd)/terraform/terraform.tfvars" 2>/dev/null | tail -1)"
+GITHUB_REPO="${GITHUB_REPO:-sathvik-23/white-pettle}"
 STATE_BUCKET="perfstaq-tfstate-global-bridge-508618-u6"
 PLACEHOLDER="us-docker.pkg.dev/cloudrun/container/hello"
 
