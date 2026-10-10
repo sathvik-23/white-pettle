@@ -81,3 +81,67 @@ export async function requireMode(orgId, operation = "manual") {
 export async function auditBilling(orgId, userId, action, detail) {
   await q(`insert into audit_log (org_id, user_id, action, detail) values ($1, $2, $3, $4)`, [orgId, userId || null, action, detail || {}]);
 }
+
+// ── Razorpay webhook lifecycle ───────────────────────────────────────────────
+// Pure: given the organisation row and a verified event, the columns to change. The webhook route runs it inside
+// a transaction with the row locked. Rules (design §8, docs/superpowers/specs/2026-10-10-white-petal-razorpay-plans-design.md):
+//   - only a signed activated/charged event grants a paid plan, and only for a plan id the server configured;
+//   - a failed renewal starts one three-day grace period; cancellation keeps the paid period;
+//   - an event older than the last applied one changes nothing; a paid period end only ever moves forward.
+const SUB_EVENTS = new Set(["subscription.authenticated", "subscription.activated", "subscription.charged", "subscription.updated", "subscription.pending", "subscription.halted", "subscription.cancelled", "subscription.completed", "subscription.paused", "subscription.resumed"]);
+const fromUnix = (v) => (v ? new Date(Number(v) * 1000) : null);
+const later = (a, b) => (!b ? null : !a || b > new Date(a) ? b : null); // b if it moves the date forward
+
+export function applyEvent(org, evt, { planOf, now = new Date(), graceDays = 3 } = {}) {
+  const type = String(evt?.event || "");
+  if (!SUB_EVENTS.has(type)) return { status: "ignored", reason: "not a subscription event", patch: {} };
+  const sub = evt.payload?.subscription?.entity || {};
+  const at = fromUnix(evt.created_at) || now;
+  if (org.billing_event_at && at < new Date(org.billing_event_at)) return { status: "ignored", reason: "older than the last applied event", patch: {} };
+  const patch = { billing_event_at: at };
+  const periodEnd = later(org.current_period_end, fromUnix(sub.current_end));
+  const grant = () => {
+    const mapped = planOf(sub.plan_id);
+    if (!mapped) return false;
+    Object.assign(patch, { plan_code: mapped.plan, billing_currency: mapped.currency, billing_status: "active", grace_ends_at: null });
+    if (fromUnix(sub.current_start)) patch.current_period_start = fromUnix(sub.current_start);
+    if (periodEnd) patch.current_period_end = periodEnd;
+    if (org.pending_plan_code === mapped.plan || org.pending_plan_code == null) patch.pending_plan_code = null;
+    if (sub.customer_id) patch.razorpay_customer_id = sub.customer_id;
+    return true;
+  };
+  switch (type) {
+    case "subscription.authenticated":
+      if (sub.customer_id) patch.razorpay_customer_id = sub.customer_id;
+      break; // a mandate, not a payment: no access yet
+    case "subscription.activated": case "subscription.charged": case "subscription.resumed":
+      if (!grant()) return { status: "ignored", reason: "unknown Razorpay plan id", patch: {} };
+      break;
+    case "subscription.updated":
+      // A plan change Razorpay has applied. Only an active subscription keeps its access; others wait for a charge.
+      if (sub.status === "active" && !grant()) return { status: "ignored", reason: "unknown Razorpay plan id", patch: {} };
+      break;
+    case "subscription.pending": case "subscription.halted":
+      patch.billing_status = "past_due";
+      if (!org.grace_ends_at || org.billing_status !== "past_due") patch.grace_ends_at = new Date(now.getTime() + graceDays * 864e5);
+      break;
+    case "subscription.cancelled": case "subscription.completed":
+      patch.billing_status = "canceled";
+      if (periodEnd) patch.current_period_end = periodEnd;
+      break;
+    case "subscription.paused":
+      patch.billing_status = "paused";
+      break;
+  }
+  return { status: "processed", patch };
+}
+
+// What we keep of an event: identifiers, statuses, amounts and timestamps. No card, method, email or phone.
+export function eventSummary(evt) {
+  const s = evt?.payload?.subscription?.entity || {}, p = evt?.payload?.payment?.entity;
+  return {
+    event: evt?.event, created_at: evt?.created_at,
+    subscription: { id: s.id, plan_id: s.plan_id, status: s.status, current_start: s.current_start, current_end: s.current_end, ended_at: s.ended_at, paid_count: s.paid_count, notes: s.notes && !Array.isArray(s.notes) ? { white_petal_org_id: s.notes.white_petal_org_id, white_petal_plan: s.notes.white_petal_plan } : {} },
+    ...(p ? { payment: { id: p.id, status: p.status, amount: p.amount, currency: p.currency, invoice_id: p.invoice_id } } : {}),
+  };
+}
