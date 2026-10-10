@@ -226,3 +226,112 @@ test("passwords: forgot and reset by email", { skip: !DB && "set TEST_DATABASE_U
   assert.equal((await call("m1x", "POST", "/api/auth/login", { email: "m1@ax.co", password: "member-pass-1" })).status, 401);
   assert.equal((await call("m1x", "POST", "/api/auth/login", { email: "m1@ax.co", password: "brand-new-pass" })).status, 200);
 });
+
+// ── paid plans: catalogue, checkout authorisation, signed idempotent webhooks ──
+const crypto = await import("node:crypto");
+const WHSEC = "whsec_test_only";
+async function hook(evt, id, { secret = WHSEC, sig } = {}) {
+  const raw = JSON.stringify(evt);
+  const s = sig ?? crypto.createHmac("sha256", secret).update(raw).digest("hex");
+  const r = await fetch(base + "/api/webhooks/razorpay", { method: "POST", headers: { "content-type": "application/json", "x-razorpay-signature": s, ...(id ? { "x-razorpay-event-id": id } : {}) }, body: raw });
+  return { status: r.status, data: await r.json().catch(() => null) };
+}
+const unix = (d) => Math.floor(new Date(d).getTime() / 1000);
+const subEvt = (event, sub, at = Date.now()) => ({ entity: "event", event, created_at: unix(at), payload: { subscription: { entity: { id: "sub_test_1", plan_id: "plan_growth_inr", status: "active", current_start: unix(Date.now()), current_end: unix(Date.now() + 30 * 864e5), notes: {}, ...sub } } } });
+export const fakeRzp = { calls: [], createSubscription: async (a) => { fakeRzp.calls.push(["create", a]); return { id: "sub_test_1", status: "created", short_url: "https://rzp.io/x" }; },
+  cancelSubscription: async (id) => { fakeRzp.calls.push(["cancel", id]); return { id, status: "active" }; },
+  updateSubscription: async (id, a) => { fakeRzp.calls.push(["update", id, a]); return { id, status: "active" }; },
+  fetchSubscription: async (id) => { fakeRzp.calls.push(["fetch", id]); return { id, status: "active" }; } };
+
+test("billing: catalogue, checkout authorisation and idempotent webhooks", { skip: !DB && "set TEST_DATABASE_URL" }, async () => {
+  (await import("../../server/razorpay.mjs")).setClient(fakeRzp);
+  const plans = await call("anon", "GET", "/api/billing/plans");
+  assert.equal(plans.status, 200); assert.equal(plans.data.monthlyOnly, true);
+  assert.equal(plans.data.plans.find((p) => p.code === "growth").prices.USD, 9900);
+  assert.doesNotMatch(JSON.stringify(plans.data), /razorpay|plan_id|secret/i);
+
+  // An owner with an editor, both fresh.
+  assert.equal((await call("pay", "POST", "/api/auth/signup", { email: "pay@x.co", password: "pay-pass-123" })).status, 200);
+  const inv = await call("pay", "POST", "/api/org/invitations", { email: "ed@x.co", role: "editor" });
+  assert.equal((await call("ed", "POST", "/api/auth/signup", { email: "ed@x.co", password: "ed-pass-1234", invite: tokenFrom(inv.data.invite.link) })).status, 200);
+  const slug = (await call("pay", "GET", "/api/me")).data.org.slug;
+  const [org] = await sql(`select id from organizations where slug = $1`, [slug]);
+  let bill = (await call("pay", "GET", "/api/billing")).data;
+  assert.equal(bill.plan.code, "legacy"); assert.equal(bill.mode, "write"); assert.equal(bill.canCheckout, false); // billing is off by default
+  assert.equal((await call("anon", "GET", "/api/billing")).status, 401);
+
+  // Who and what may start checkout.
+  assert.equal((await call("ed", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR" })).status, 403);
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "made-up", currency: "USD" })).status, 400);
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "enterprise", currency: "USD" })).status, 400);
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "growth", currency: "EUR" })).status, 400);
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR" })).data.code, "billing_disabled");
+  process.env.BILLING_ENABLED = "operators";
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR" })).data.code, "billing_operators_only");
+  Object.assign(process.env, { BILLING_ENABLED: "1", RAZORPAY_KEY_ID: "rzp_test_key", RAZORPAY_KEY_SECRET: "rzp_secret_x", RAZORPAY_WEBHOOK_SECRET: WHSEC });
+  assert.equal((await call("pay", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR" })).data.code, "plan_unavailable"); // no plan id configured
+  Object.assign(process.env, { RAZORPAY_PLAN_GROWTH_INR: "plan_growth_inr", RAZORPAY_PLAN_STARTER_INR: "plan_starter_inr", RAZORPAY_PLAN_AGENCY_INR: "plan_agency_inr" });
+  const co = await call("pay", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR", planId: "plan_evil", amount: 1 });
+  assert.equal(co.status, 200);
+  assert.deepEqual({ ...co.data, name: undefined }, { subscriptionId: "sub_test_1", keyId: "rzp_test_key", plan: "growth", currency: "INR", amount: 999900, name: undefined, testMode: true });
+  assert.equal(fakeRzp.calls.at(-1)[1].planId, "plan_growth_inr"); assert.equal(fakeRzp.calls.at(-1)[1].orgId, org.id);
+  assert.ok(!JSON.stringify(co.data).includes("rzp_secret_x"));
+  // Checking out changes nothing until Razorpay says so.
+  assert.equal((await call("pay", "GET", "/api/billing")).data.plan.code, "legacy");
+
+  // Webhooks: signature on the raw body, required.
+  assert.equal((await hook(subEvt("subscription.activated"), "evt_1", { sig: "" })).status, 400);
+  assert.equal((await hook(subEvt("subscription.activated"), "evt_1", { secret: "wrong" })).status, 400);
+  assert.equal((await sql(`select count(*)::int as n from billing_events`))[0].n, 0);
+  const act = subEvt("subscription.activated");
+  assert.equal((await hook(act, "evt_1")).status, 200);
+  bill = (await call("ed", "GET", "/api/billing")).data;
+  assert.equal(bill.plan.code, "growth"); assert.equal(bill.plan.status, "active"); assert.equal(bill.plan.currency, "INR");
+  assert.equal(bill.entitlements.questions, 30); assert.equal(bill.plan.subscriptionId, undefined); // payment ids are for admins
+  // The same event again (Razorpay retries) changes nothing and is recorded once.
+  const dup = await hook(act, "evt_1"); assert.equal(dup.status, 200); assert.equal(dup.data.duplicate, true);
+  assert.equal((await sql(`select count(*)::int as n from billing_events where event_id = 'evt_1'`))[0].n, 1);
+  assert.equal((await sql(`select count(*)::int as n from audit_log where org_id = $1 and action = 'billing.subscription.activated'`, [org.id]))[0].n, 1);
+  const [stored] = await sql(`select payload, org_id, status from billing_events where event_id = 'evt_1'`);
+  assert.equal(stored.org_id, org.id); assert.equal(stored.status, "processed"); assert.equal(stored.payload.subscription.id, "sub_test_1");
+  // An event nobody owns is recorded and ignored.
+  assert.equal((await hook(subEvt("subscription.activated", { id: "sub_other" }), "evt_x")).status, 200);
+  assert.equal((await sql(`select status from billing_events where event_id = 'evt_x'`))[0].status, "ignored");
+  // Another organisation is untouched and cannot see this one's billing.
+  assert.equal((await call("b2", "GET", "/api/billing")).data.plan.code, "legacy");
+
+  // Plan changes: a downgrade waits for the period end; an upgrade waits for Razorpay to charge.
+  assert.equal((await call("ed", "POST", "/api/billing/change-plan", { plan: "starter" })).status, 403);
+  const down = await call("pay", "POST", "/api/billing/change-plan", { plan: "starter" });
+  assert.equal(down.status, 200); assert.equal(down.data.plan.pendingPlan, "starter"); assert.equal(down.data.plan.code, "growth");
+  assert.deepEqual(fakeRzp.calls.at(-1), ["update", "sub_test_1", { planId: "plan_starter_inr", at: "cycle_end" }]);
+  const up = await call("pay", "POST", "/api/billing/change-plan", { plan: "agency" });
+  assert.equal(up.data.plan.code, "growth"); assert.equal(up.data.plan.pendingPlan, null);
+  assert.deepEqual(fakeRzp.calls.at(-1), ["update", "sub_test_1", { planId: "plan_agency_inr", at: "now" }]);
+  assert.equal((await hook(subEvt("subscription.charged", { plan_id: "plan_agency_inr" }), "evt_2")).status, 200);
+  assert.equal((await call("pay", "GET", "/api/billing")).data.plan.code, "agency");
+
+  // Failed renewal: three days of grace, then read-only. Reports stay readable.
+  assert.equal((await hook(subEvt("subscription.pending", { status: "pending" }), "evt_3")).status, 200);
+  bill = (await call("pay", "GET", "/api/billing")).data;
+  assert.equal(bill.plan.status, "past_due"); assert.equal(bill.mode, "manual");
+  assert.ok(new Date(bill.period.graceEndsAt) > Date.now() + 2.9 * 864e5);
+  // An older event arriving late is ignored.
+  assert.equal((await hook(subEvt("subscription.charged", {}, Date.now() - 864e5), "evt_old")).status, 200);
+  assert.equal((await sql(`select status from billing_events where event_id = 'evt_old'`))[0].status, "ignored");
+  assert.equal((await call("pay", "GET", "/api/billing")).data.plan.status, "past_due");
+  assert.equal((await hook(subEvt("subscription.charged", { plan_id: "plan_agency_inr" }), "evt_4")).status, 200);
+  assert.equal((await call("pay", "GET", "/api/billing")).data.plan.status, "active");
+
+  // Cancellation: owner only; access continues to the end of the paid period.
+  assert.equal((await call("ed", "POST", "/api/billing/cancel")).status, 403);
+  const cancel = await call("pay", "POST", "/api/billing/cancel");
+  assert.equal(cancel.status, 200); assert.equal(cancel.data.plan.cancelAtPeriodEnd, true); assert.equal(cancel.data.plan.status, "active");
+  assert.equal((await hook(subEvt("subscription.cancelled", { status: "cancelled" }), "evt_5")).status, 200);
+  bill = (await call("pay", "GET", "/api/billing")).data;
+  assert.equal(bill.plan.status, "canceled"); assert.equal(bill.mode, "write");
+  await sql(`update organizations set current_period_end = now() - interval '1 minute' where id = $1`, [org.id]);
+  assert.equal((await call("pay", "GET", "/api/billing")).data.mode, "read");
+
+  for (const k of ["BILLING_ENABLED", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_PLAN_GROWTH_INR", "RAZORPAY_PLAN_STARTER_INR", "RAZORPAY_PLAN_AGENCY_INR"]) delete process.env[k];
+});

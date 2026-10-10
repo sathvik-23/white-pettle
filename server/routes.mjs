@@ -17,6 +17,7 @@ import { runCheck } from "./runner.mjs";
 import { slugify, emailOk, normEmail } from "./util.mjs";
 import * as O from "./orgs.mjs";
 import * as mail from "./mail.mjs";
+import { makeBillingRoutes } from "./billing-routes.mjs";
 
 const SESSION = "wp_session";
 const GSTATE = "wp_gstate";
@@ -220,6 +221,8 @@ const roleOk = (r) => O.ROLES.includes(r);
 // ── route table ─────────────────────────────────────────────────────────────
 // [method, pattern, handler(req, res, params, url)]. Patterns use :name segments.
 export const ROUTES = [
+  // ── billing (first, so the webhook is matched before anything generic) ──
+  ...makeBillingRoutes({ needCtx }),
   // ── accounts ──
   ["POST", "/api/auth/signup", async (req, res) => {
     needDb();
