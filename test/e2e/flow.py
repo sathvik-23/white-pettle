@@ -125,6 +125,14 @@ with sync_playwright() as p:
     if pg.query_selector("[data-howto]"): pg.click("[data-howto]"); time.sleep(0.3); shot("16_howto"); pg.keyboard.press("Escape")
     pg.click('#side [data-page="chats"]'); time.sleep(0.2); pg.click("tr[data-chat]"); time.sleep(0.4); shot("13_chat_modal")
     pg.keyboard.press("Escape"); time.sleep(0.2)
+    # Billing & usage: plan, usage meters and plan cards; checkout stays off unless BILLING_ENABLED is set
+    pg.click("#navBilling"); pg.wait_for_selector("#billing:not([hidden]) .billing-grid", timeout=5000); time.sleep(0.3); shot("14_billing")
+    bill = pg.inner_text("#billBody")
+    for want in ["Billing & usage", "Brands", "Tracked questions", "Action drafts", "Seats", "Starter", "Growth", "Agency", "Enterprise", "Most popular"]:
+        assert want in bill, f"billing page is missing {want!r}"
+    assert "Studio credit" not in bill and "two months free" not in bill.lower()
+    pg.click("[data-billcur=INR]"); time.sleep(0.2); assert "₹9,999" in pg.inner_text("#billBody") and "GST" in pg.inner_text("#billBody")
+    pg.click("#billBack"); time.sleep(1)
     # the run is on the server now: a fresh tab with the same session lands on this brand's dashboard
     time.sleep(5)
     pg2 = ctx.new_page(); pg2.on("pageerror", lambda e: errors.append("PAGEERROR2 " + str(e)))

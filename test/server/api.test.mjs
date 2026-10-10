@@ -347,7 +347,7 @@ test("billing: plan limits are enforced on the server", { skip: !DB && "set TEST
   assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", site: "https://first.example", setup: S })).status, 200);
   const second = await call("st", "PUT", "/api/workspaces/second", { name: "Second", site: "https://second.example", setup: S });
   assert.equal(second.status, 402); assert.equal(second.data.code, "plan_limit"); assert.equal(second.data.capability, "brands");
-  assert.equal(second.data.recommendedPlan, "growth"); assert.match(second.data.error, /1 brand\b.*Upgrade to Growth/);
+  assert.equal(second.data.recommendedPlan, "growth"); assert.equal(second.data.error, "Starter includes 1 brand. Upgrade to Growth to continue.");
   assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, questions: qs(16) } })).data.capability, "questions");
   assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, questions: qs(15) } })).status, 200);
   assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, profile: { ...S.profile, competitors: ["a", "b", "c", "d"] } } })).data.capability, "competitors");

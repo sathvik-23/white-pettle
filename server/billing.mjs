@@ -25,10 +25,10 @@ const UPGRADE = { trial: "growth", starter: "growth", growth: "agency", agency: 
 export const nextPlan = (code) => UPGRADE[code] || "enterprise";
 
 const LABEL = { brands: "brand", questions: "tracked question", competitors: "competitor per brand", seats: "seat", actionDrafts: "action draft", engines: "engine", schedule: "schedule", samples: "sample per question", integrations: "integration", whiteLabel: "white-label report", api: "API access", baselineRuns: "trial check" };
-export function planError(capability, used, limit, recommendedPlan, resetsAt = null) {
+export function planError(capability, used, limit, recommendedPlan, resetsAt = null, planName = null) {
   const what = LABEL[capability] || capability;
   const lim = typeof limit === "number" ? `${limit} ${what}${limit === 1 ? "" : "s"}` : `${what}: ${limit}`;
-  return new HttpError(402, `Your plan includes ${lim}. Upgrade to ${PLANS[recommendedPlan]?.name || recommendedPlan} to continue.`, {
+  return new HttpError(402, `${planName || "Your plan"} includes ${lim}. Upgrade to ${PLANS[recommendedPlan]?.name || recommendedPlan} to continue.`, {
     code: "plan_limit", capability, used, limit, recommendedPlan, resetsAt,
   });
 }
@@ -151,7 +151,7 @@ export function eventSummary(evt) {
 // change would go past the plan. Reductions are always allowed, so an organisation over its limit after a
 // downgrade can get back under it.
 const activeQuestions = (setup) => (setup?.questions || []).filter((x) => x && x.on !== false).length;
-const limitError = (state, capability, used, limit) => planError(capability, used, limit, nextPlan(state.org.plan_code), state.period.end);
+const limitError = (state, capability, used, limit) => planError(capability, used, limit, nextPlan(state.org.plan_code), state.period.end, PLANS[state.org.plan_code]?.name);
 const allowsIntegration = (e, provider) => e.integrations === "all" || (Array.isArray(e.integrations) && e.integrations.includes(provider));
 
 export async function assertBrandCreate(orgId) {

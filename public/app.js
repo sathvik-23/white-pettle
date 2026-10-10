@@ -30,7 +30,7 @@ async function post(path, payload, signal) {
   const r = await fetch(path, { method: "POST", headers: aiHeaders(), body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
+  if (!r.ok) { const err = new Error(d.error || `Server error ${r.status}`); err.data = d; if (PLAN_LOCK_CODES.has(d.code)) showPlanLock(d); throw err; }
   return d;
 }
 async function stream(path, payload, on, signal, idleMs = 75000) {
@@ -46,7 +46,7 @@ async function stream(path, payload, on, signal, idleMs = 75000) {
 async function streamInner(path, payload, on, signal, kick) {
   const r = await fetch(path, { method: "POST", headers: aiHeaders(), body: JSON.stringify(payload), signal, cache: "no-store" });
   if (r.status === 401) { if (APP.cfg.db) { APP.user = null; showAuth("signin"); throw new Error("Please sign in again."); } APP.code = ""; store.set("code", ""); APP.cfg.access = true; $("#accessRow").hidden = false; $("#accessCode").value = ""; throw new Error("That access code didn't work. Go back and enter it again (it's ACCESS_CODE in the server's environment)."); }
-  if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
+  if (!r.ok || !r.body) { const d = await r.json().catch(() => ({})); if (PLAN_LOCK_CODES.has(d.code)) showPlanLock(d); const err = new Error(d.error || `Server error ${r.status}`); err.data = d; throw err; }
   const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", err = null;
   for (;;) {
     const { value, done } = await reader.read(); if (done) break;
@@ -74,7 +74,7 @@ async function api(method, path, body) {
   const r = await fetch(path, { method, headers: body ? { "content-type": "application/json", "x-wp-brand": APP.M?.slug || "" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin", cache: "no-store" });
   const d = await r.json().catch(() => ({}));
   if (r.status === 401 && d.code === "auth") { APP.user = null; showAuth("signin"); throw new Error("Please sign in."); }
-  if (!r.ok) throw new Error(d.error || `Server error ${r.status}`);
+  if (!r.ok) { const err = new Error(d.error || `Server error ${r.status}`); err.data = d; if (PLAN_LOCK_CODES.has(d.code)) showPlanLock(d); throw err; }
   return d;
 }
 const DATA = {
@@ -216,6 +216,7 @@ async function handleAuthHash() {
 
 // Signed in: straight to the most recently used brand. Otherwise the landing page.
 async function home() {
+  if (DATA.server() && peekPlanHint()) return openBilling();
   if (DATA.server()) {
     const first = DATA.companies()[0];
     if (first) { const ok = await openBrand(first.slug, { quiet: true }); if (ok) return; }
@@ -262,7 +263,7 @@ function paintLanding() {
     return `<button type="button" class="bcard" data-brand="${esc(c.slug)}">${favImg(host(c.profile.site))}<span class="bc-main"><b>${esc(c.profile.name)}</b><span class="muted">${esc(host(c.profile.site || ""))}</span></span>
       <span class="bc-num"><b>${last ? last.score : "–"}</b><span class="muted">score</span></span><span class="bc-num"><b>${last ? pct(last.visibility, 0) : "–"}</b><span class="muted">visibility</span></span>
       <span class="bc-spark">${sparkline(t.map((x) => x.summary?.visibility))}</span>
-      <span class="bc-sched ${w.schedule && w.schedule !== "off" ? "on" : ""}">${w.schedule && w.schedule !== "off" ? `${w.schedule === "daily" ? "Daily" : "Weekly"} checks` : "Manual"}</span></button>`;
+      <span class="bc-sched ${w.schedule && w.schedule !== "off" ? "on" : ""}">${w.schedule && w.schedule !== "off" ? `${w.schedule === "daily" ? "Daily" : w.schedule === "rotating" ? "Daily priority" : "Weekly"} checks` : "Manual"}</span></button>`;
   }).join("");
 }
 $("#lpBrands").addEventListener("click", (e) => { const b = e.target.closest("[data-brand]"); if (b) openBrand(b.dataset.brand); });
@@ -909,7 +910,11 @@ function rebuildMap(M) {
   Object.entries(M.inspections).forEach(([u, r]) => { const sid = sidOf(u); gNode(sid, "source", host(r.final || u), { url: u, inspected: true, you: !!r.you, rivals: (r.rivals || []).length }); if (r.you) gLink(sid, "you", "on", "#FF7A1A"); (r.rivals || []).forEach((rv) => gLink(sid, "r:" + norm(rv), "on", "#E2483D")); });
 }
 $("#rerun").addEventListener("click", async () => { const M = APP.M; if (!M) return; if (await lockedElsewhere(M.slug)) return toast("This brand is running in another tab right now."); startOnboarding(M.profile.site, DATA.company(M.slug) || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines, samples: M.samples }); });
-$("#newBrand").addEventListener("click", goHome);
+$("#newBrand").addEventListener("click", () => {
+  const b = APP.cfg.billing; // the server refuses a brand past the plan anyway; say so before the onboarding, not after
+  if (b && b.entitlements.brands != null && b.usage.brands >= b.entitlements.brands) return showPlanLock({ code: "plan_limit", error: `${b.plan.name} includes ${b.entitlements.brands} brand${b.entitlements.brands === 1 ? "" : "s"}. Upgrade to ${{ growth: "Growth", agency: "Agency", enterprise: "Enterprise" }[b.recommendedPlan] || "a bigger plan"} to add another.` });
+  goHome();
+});
 function goHome() { APP.ctl?.abort(); APP.running = false; OB = null; document.body.classList.remove("sheet-open"); if (APP.M) lockRelease(APP.M.slug); toggleAgent(false); screen("landing"); $("#startUrl").value = ""; paintLanding(); renderRecent(); if (DATA.server()) DATA.refresh().then(paintLanding).catch(() => {}); }
 
 /* ---------- action deck ---------- */
@@ -999,7 +1004,7 @@ async function ask(q) {
 }
 
 /* =================================================================== SCREENS */
-const SCREENS = ["landing", "auth", "mission", "onboard", "ready", "reportWrap", "team"];
+const SCREENS = ["landing", "auth", "mission", "onboard", "ready", "reportWrap", "team", "billing"];
 function screen(id) {
   SCREENS.forEach((s) => ($("#" + s).hidden = s !== id));
   document.body.classList.add("is-light"); // every screen is light now; the agent console included
@@ -1035,6 +1040,7 @@ const ICONS = {
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   out: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/>',
   team: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.6-3 2.8-4.6 5.5-4.6s4.9 1.6 5.5 4.6"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14.6c2.4-.3 4.3 1 5 3.9"/>',
+  card: '<rect x="3" y="5.5" width="18" height="13" rx="2.2"/><path d="M3 10h18M7 15h4"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l3 3M14 9l2 2"/>',
 };
 const icon = (k, s = 16) => `<svg class="ic" viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k] || ""}</svg>`;
@@ -1612,6 +1618,7 @@ function dashRender() {
   // Hide what this person's role can't do (the server refuses it anyway): viewers change nothing, editors don't connect tools or delete brands.
   $("#reportWrap").classList.toggle("ro", !canEdit()); $("#reportWrap").classList.toggle("not-admin", !canAdmin());
   $("#navTeam").hidden = !DATA.server(); if (APP.org) $("#navTeamTxt").textContent = `${APP.org.name} · Team`;
+  $("#navBilling").hidden = !DATA.server(); paintBillingBanner();
   const m = metrics(M, DASH.eng), pm = prevMetrics(M, DASH.eng);
   $("#pages").innerHTML = `<div class="pg">${(PAGE[DASH.page] || PAGE.overview)(M, m, pm)}</div>`;
   if (DASH.page === "actions") drawDeck();
@@ -1946,8 +1953,9 @@ Object.assign(PAGE, {
     const moveCard = canAdmin() && moveTo.length ? `<div class="card"><div class="card-h"><b>Move to another organisation</b><span class="muted">Brings its history, prompts and integrations along</span></div><div class="pad set"><div class="srow"><select id="moveOrg" class="sel">${moveTo.map((o) => `<option value="${esc(o.slug)}">${esc(o.name)}</option>`).join("")}</select><button type="button" class="btn ghost sm" data-move>Move ${esc(M.profile.name)}</button></div></div></div>` : "";
     return head("Settings", `How White Petal tracks ${esc(M.profile.name)}.`) + roleNote
       + `<div class="grid2"><div class="card"><div class="card-h"><b>Automatic checks</b><span class="muted">Runs on the server; you can close the tab</span></div><div class="pad set">
-          <div class="srow"><span>Re-run every prompt</span><div class="seg">${[["off", "Off"], ["weekly", "Weekly"], ["daily", "Daily"]].map(([k, l]) => `<button type="button" data-sched="${k}" aria-pressed="${sched === k}">${l}</button>`).join("")}</div></div>
-          <div class="srow"><span>Answers per prompt <span class="muted sm">averages out AI's run-to-run variation</span></span><div class="seg">${[1, 2, 3].map((k) => `<button type="button" data-samp="${k}" aria-pressed="${samples === k}">${k}×</button>`).join("")}</div></div>
+          <div class="srow"><span>Re-run every prompt</span><div class="seg">${schedOptions(sched).map(([k, l]) => planLocked("schedule", k, `<button type="button" data-sched="${k}" aria-pressed="${sched === k}">${l}</button>`)).join("")}</div></div>
+          <div class="srow"><span>Answers per prompt <span class="muted sm">averages out AI's run-to-run variation</span></span><div class="seg">${[1, 2, 3].map((k) => planLocked("samples", k, `<button type="button" data-samp="${k}" aria-pressed="${samples === k}">${k}×</button>`)).join("")}</div></div>
+          ${planNote()}
           <div class="srow"><span class="muted">${ws?.running ? "A check is running now." : ws?.nextRunAt ? `Next check ${new Date(ws.nextRunAt).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}` : "No automatic checks scheduled."}${ws?.lastRunAt ? ` · last ${new Date(ws.lastRunAt).toLocaleDateString()}` : ""}</span><button type="button" class="btn ghost sm" data-queue>Queue a check now</button></div>
           <p class="muted sm">About ${(c.questions || M.questions).filter((q) => q.on !== false).length * M.engines.length * samples} AI answers per check. Engines: ${M.engines.map((e) => ENG[e]).join(", ")}.</p>
         </div></div>
@@ -1986,7 +1994,7 @@ $("#reportWrap").addEventListener("click", async (e) => {
   const busy = (b, txt) => { b.setAttribute("aria-disabled", "true"); const o = b.textContent; b.textContent = txt; return () => { b.removeAttribute("aria-disabled"); b.textContent = o; }; };
   try {
     if (t.closest("#navSettings")) { DASH.page = "settings"; return dashRender(); }
-    const sc = t.closest("[data-sched]"); if (sc) { await DATA.patch(slug, { schedule: sc.dataset.sched }); toast(sc.dataset.sched === "off" ? "Automatic checks are off." : `${sc.dataset.sched === "daily" ? "Daily" : "Weekly"} checks are on.`); return dashRender(); }
+    const sc = t.closest("[data-sched]"); if (sc) { await DATA.patch(slug, { schedule: sc.dataset.sched }); toast(sc.dataset.sched === "off" ? "Automatic checks are off." : `${{ daily: "Daily", weekly: "Weekly", rotating: "Weekly full and daily priority" }[sc.dataset.sched]} checks are on.`); return dashRender(); }
     const sp = t.closest("[data-samp]"); if (sp) { await DATA.patch(slug, { samples: +sp.dataset.samp }); return dashRender(); }
     if (t.closest("[data-queue]")) { await DATA.patch(slug, { runNow: true }); toast("Queued. The server starts it within about 10 minutes, so you can close this tab. Results appear here."); return dashRender(); }
     if (t.closest("[data-editsetup]")) { const c = DATA.company(slug); return startOnboarding(M.profile.site, c || { profile: M.profile, questions: M.questions.map((q) => ({ ...q, on: true })), engines: M.engines }); }
@@ -2218,6 +2226,195 @@ document.addEventListener("click", (e) => { if (e.target.id === "toTeamKeys") op
 // A link opened in a tab that already has the app (same page, new #hash): handle it without a reload.
 addEventListener("hashchange", async () => { if (/^#(invite|reset|verify|auth-error)=/.test(location.hash) && !(await handleAuthHash())) home(); });
 
+/* =================================================================== BILLING
+   The organisation's plan, what it has used, plan choice and Razorpay checkout. The server decides everything
+   (server/billing.mjs); this page explains it. A finished checkout only starts polling: the plan changes when
+   Razorpay's signed webhook reaches the server, never because the browser said so. */
+// Schedule and sample controls mirror the plan: what it doesn't include stays visible, disabled, with the reason.
+const ent = () => APP.cfg.billing?.entitlements || null;
+function schedOptions(cur) {
+  const e = ent(), opts = [["off", "Off"], ["weekly", "Weekly"], ["rotating", "Weekly + daily priority"], ["daily", "Daily"]];
+  return opts.filter(([k]) => k === cur || !e || e.schedule.includes(k) || k !== "rotating");
+}
+function planLocked(kind, value, html) {
+  const e = ent(); if (!e) return html;
+  const ok = kind === "schedule" ? e.schedule.includes(value) : kind === "samples" ? value <= e.samples : true;
+  if (ok) return html;
+  const why = `Not in ${APP.cfg.billing.plan.name}. See Billing & usage to upgrade.`;
+  return html.replace("<button ", `<button aria-disabled="true" title="${esc(why)}" `);
+}
+function planNote() {
+  const b = APP.cfg.billing; if (!b || b.plan.code === "legacy") return "";
+  return `<p class="muted sm">${esc(b.plan.name)}: ${b.entitlements.schedule.filter((x) => x !== "off").join(", ") || "manual"} checks, up to ${b.entitlements.samples} answer${b.entitlements.samples === 1 ? "" : "s"} per prompt. <button type="button" class="lnk" data-openbilling>Billing &amp; usage</button></p>`;
+}
+const BILL = { d: null, plans: null, currency: null, confirming: null, cancelArmed: false };
+const PLAN_HINT = "wpetal:planHint";
+const SELF_SERVE = ["starter", "growth", "agency"];
+const PLAN_LOCK_CODES = new Set(["plan_limit", "billing_read_only", "email_verification_required"]);
+const STATUS_LABEL = { internal: "Included", trialing: "Trial", active: "Active", past_due: "Payment failed", canceled: "Cancelled", paused: "Paused" };
+const ENT_LABEL = { brands: "Brands", questions: "Tracked questions", actionDrafts: "Action drafts this period", seats: "Seats", runs: "Checks this period" };
+const money = (minor, cur) => (cur === "INR" ? `₹${(minor / 100).toLocaleString("en-IN")}` : `$${(minor / 100).toLocaleString("en-US")}`);
+const unlimited = (v) => v == null || v === Infinity;
+const indiaGuess = () => { try { return /^Asia\/(Kolkata|Calcutta)$/.test(Intl.DateTimeFormat().resolvedOptions().timeZone); } catch { return false; } };
+
+// Bloom links here with ?plan=growth&currency=INR. Only known values are kept; they survive sign-up or sign-in.
+(function capturePlanHint() {
+  const u = new URL(location.href), plan = u.searchParams.get("plan"), cur = u.searchParams.get("currency");
+  if (!plan && !cur) return;
+  const hint = { plan: [...SELF_SERVE, "enterprise"].includes(plan) ? plan : null, currency: ["USD", "INR"].includes(cur) ? cur : null };
+  try { if (hint.plan || hint.currency) sessionStorage.setItem(PLAN_HINT, JSON.stringify(hint)); } catch {}
+  u.searchParams.delete("plan"); u.searchParams.delete("currency");
+  history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
+})();
+function takePlanHint() { try { const h = JSON.parse(sessionStorage.getItem(PLAN_HINT) || "null"); sessionStorage.removeItem(PLAN_HINT); return h; } catch { return null; } }
+function peekPlanHint() { try { return JSON.parse(sessionStorage.getItem(PLAN_HINT) || "null"); } catch { return null; } }
+
+// One way to explain a locked action, wherever it came from.
+function planLockHtml(d) {
+  if (d.code === "email_verification_required") return `${esc(d.error)} <button type="button" class="lnk" data-sendverify>Send the link again</button>`;
+  return `${esc(d.error)} <button type="button" class="lnk" data-openbilling>See plans</button>`;
+}
+function showPlanLock(d) { toast(planLockHtml(d)); }
+document.addEventListener("click", async (e) => {
+  if (e.target.closest("[data-openbilling]")) return openBilling();
+  if (e.target.closest(".toast [data-sendverify]")) { try { const r = await api("POST", "/api/auth/verify/send"); toast(r.already ? "Your email is already confirmed." : `Sent to ${esc(APP.user?.email || "you")}.`); } catch (err) { toast(esc(err.message)); } }
+});
+
+async function openBilling() {
+  if (!DATA.server()) return;
+  screen("billing"); $("#billUser").innerHTML = `<span class="muted">${esc(APP.user.email)}</span>`;
+  $("#billBody").innerHTML = `<p class="muted pad">Loading…</p>`;
+  const hint = takePlanHint();
+  try { [BILL.d, BILL.plans] = await Promise.all([api("GET", "/api/billing"), api("GET", "/api/billing/plans")]); }
+  catch (e) { $("#billBody").innerHTML = `<p class="err pad">${esc(e.message)}</p>`; return; }
+  BILL.currency = hint?.currency || BILL.d.plan.currency || BILL.currency || (indiaGuess() ? "INR" : "USD");
+  BILL.focus = hint?.plan || null;
+  paintBilling();
+  if (BILL.focus) setTimeout(() => $(`[data-plancard="${BILL.focus}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 60);
+}
+
+function billingMeter(label, used, limit) {
+  const pct = !unlimited(limit) && limit > 0 ? Math.min(100, Math.round((100 * used) / limit)) : 0;
+  const full = !unlimited(limit) && used >= limit;
+  return `<div class="bill-meter ${full ? "full" : ""}"><div><b>${esc(label)}</b><span>${used.toLocaleString()} / ${unlimited(limit) ? "Unlimited" : limit.toLocaleString()}</span></div><i role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="${unlimited(limit) ? used : limit}" aria-valuenow="${used}"><b style="width:${pct}%"></b></i></div>`;
+}
+function billingDates(d) {
+  const p = d.period, s = d.plan.status;
+  if (s === "trialing") return p.trialEndsAt ? `Trial ends ${fmtDay(p.trialEndsAt)}` : "Your trial starts when you confirm your email.";
+  if (s === "past_due") return d.mode === "read" ? `Payment failed. The grace period ended ${fmtDay(p.graceEndsAt)}; reports stay readable.` : `Payment failed. Grace period until ${fmtDay(p.graceEndsAt)}; scheduled checks are paused.`;
+  if (s === "canceled") return d.mode === "read" ? `Ended ${fmtDay(p.end)}.` : `Cancelled. Access continues until ${fmtDay(p.end)}.`;
+  if (s === "active") return d.plan.cancelAtPeriodEnd ? `Cancels on ${fmtDay(p.end)}. Nothing more will be charged.` : p.end ? `Renews ${fmtDay(p.end)}` : "Active";
+  if (s === "internal") return "Your organisation keeps its current access. Paid plans are optional for now.";
+  return "";
+}
+function planFeatures(p) {
+  const e = p.entitlements, n = (v, one, many) => (unlimited(v) ? `Unlimited ${many}` : `${v} ${v === 1 ? one : many}`);
+  const sched = e.schedule.includes("daily") ? "Daily or contract re-checks" : e.schedule.includes("rotating") ? "Weekly full re-check + daily priority prompts" : e.schedule.includes("weekly") ? "Weekly re-check" : "Manual checks";
+  return [n(e.brands, "brand", "brands") + (p.code === "enterprise" ? " (or by contract)" : ""), `${n(e.questions, "tracked question", "tracked questions")}${p.code === "agency" ? " pooled" : ""}`, `${n(e.competitorsPerBrand, "competitor", "competitors")} per brand`,
+    e.engines.length <= 3 ? "ChatGPT, Perplexity, Gemini" : "All enabled AI engines", sched, n(e.seats, "seat", "seats"), `${n(e.actionDrafts, "action draft", "action drafts")} a month`,
+    e.whiteLabel ? "White-labelled reports" : null, e.api === true ? "API access" : e.api === "export" ? "Exports and limited API" : null, `${e.trendMonths}-month trend history`].filter(Boolean);
+}
+function paintBilling() {
+  const d = BILL.d, cur = BILL.currency, o = APP.org || {};
+  const ent = d.entitlements, u = d.usage, plan = d.plan;
+  const hasSub = ["active", "past_due"].includes(plan.status) && !!plan.subscriptionId;
+  const banner = billingBannerHtml(d, true);
+  const confirming = BILL.confirming ? `<div class="billing-banner info" role="status"><span class="spin" aria-hidden="true"></span><div><b>Confirming payment…</b> <span class="muted">Razorpay has your payment. Your plan changes as soon as Razorpay confirms it to us, usually within a minute.</span></div></div>` : "";
+  const meters = [["brands", u.brands, ent.brands], ["questions", u.questions, ent.questions], ["actionDrafts", u.actionDrafts, ent.actionDrafts], ["seats", u.seats, ent.seats]]
+    .concat(ent.baselineRuns != null ? [["runs", u.runs, ent.baselineRuns]] : []).map(([k, a, b]) => billingMeter(ENT_LABEL[k], a, b)).join("");
+  const why = !d.checkout.enabled || d.checkout.enabled === "0" ? "Paid plans open soon. Nothing changes for you meanwhile." : !d.canCheckout ? (["owner", "admin"].includes(o.role) ? "Paid plans are open to the White Petal team only for now." : "Only the owner or an admin can change the plan.") : "";
+  const cards = BILL.plans.plans.map((p) => {
+    const current = p.code === plan.code && ["active", "past_due"].includes(plan.status), pending = plan.pendingPlan === p.code;
+    let cta;
+    if (!p.selfServe) cta = `<a class="btn ghost sm" href="mailto:sales@perfstaq.com?subject=${encodeURIComponent("White Petal Enterprise")}">Talk to us</a>`;
+    else if (current) cta = `<span class="pillx ok">Current plan</span>`;
+    else if (pending) cta = `<span class="pillx">Starts ${fmtDay(d.period.end)}</span>`;
+    else if (!d.canCheckout) cta = `<button type="button" class="btn sm" aria-disabled="true" title="${esc(why)}">Choose ${esc(p.name)}</button>`;
+    else if (hasSub) cta = `<button type="button" class="btn sm" data-changeplan="${p.code}">Switch to ${esc(p.name)}</button>`;
+    else cta = `<button type="button" class="btn sm" data-checkout="${p.code}">Choose ${esc(p.name)}</button>`;
+    return `<div class="billing-card ${p.featured ? "featured" : ""} ${BILL.focus === p.code ? "focus" : ""}" data-plancard="${p.code}">
+      ${p.featured ? `<span class="billing-flag">Most popular</span>` : ""}
+      <b class="billing-name">${esc(p.name)}</b>
+      <div class="billing-price">${p.code === "enterprise" ? "From " : ""}<span>${money(p.prices[cur], cur)}</span><small>/month${cur === "INR" ? " + GST" : ""}</small></div>
+      <ul>${planFeatures(p).map((f) => `<li>${esc(f)}</li>`).join("")}</ul>
+      <div class="billing-cta">${cta}</div></div>`;
+  }).join("");
+  const cancel = d.canCancel && hasSub && !plan.cancelAtPeriodEnd ? `<button type="button" class="lnk sm" data-cancelplan>${BILL.cancelArmed ? "Click again to cancel at the end of this period" : "Cancel subscription"}</button>` : "";
+  $("#billBody").innerHTML = `${confirming}${banner}
+    <div class="team-head"><div><span class="lp-kicker">Organisation</span><h1>Billing &amp; usage</h1><p class="muted">${esc(o.name || "")}</p></div></div>
+    <div class="card billing-current"><div class="card-h"><b>${esc(plan.name || plan.code)}</b><span class="pillx ${plan.status === "active" || plan.status === "internal" ? "ok" : plan.status === "past_due" ? "warn" : plan.status === "trialing" ? "" : "no"}">${esc(STATUS_LABEL[plan.status] || plan.status)}</span>${plan.currency ? `<span class="muted">${esc(plan.currency)}</span>` : ""}<span class="sp"></span>${cancel}</div>
+      <div class="pad set"><p class="muted">${esc(billingDates(d))}${plan.pendingPlan ? ` Moving to ${esc(BILL.plans.plans.find((x) => x.code === plan.pendingPlan)?.name || plan.pendingPlan)} on ${fmtDay(d.period.end)}.` : ""}</p>
+      <div class="billing-meters">${meters}</div>
+      ${d.period.usageResetsAt ? `<p class="muted sm">Usage resets ${fmtDay(d.period.usageResetsAt)}.</p>` : ""}</div></div>
+    <div class="sec-h billing-sec"><h3>Plans</h3><p>Monthly billing, cancel any time. ${cur === "INR" ? "GST is added to rupee prices." : "Taxes are added where required."}</p>
+      <div class="seg" role="group" aria-label="Currency">${["USD", "INR"].map((c) => `<button type="button" data-billcur="${c}" aria-pressed="${cur === c}">${c === "USD" ? "US$" : "₹ India"}</button>`).join("")}</div></div>
+    ${why ? `<p class="muted sm">${esc(why)}</p>` : ""}
+    <div class="billing-grid">${cards}</div>
+    <p class="muted sm">Enterprise is software with contract limits. Managed GEO and strategy work is a separate service, from $2,500 a month.${d.checkout.testMode ? " · Payments are in Razorpay test mode." : ""}</p>`;
+}
+
+// A short note at the top of the dashboard when the organisation can't do everything its plan normally allows.
+function billingBannerHtml(b, onBillingPage = false) {
+  if (!b) return "";
+  const link = onBillingPage ? "" : ` <button type="button" class="lnk" data-openbilling>Billing &amp; usage</button>`;
+  if (b.plan.status === "trialing" && !b.period.trialEndsAt) return `<div class="billing-banner warn">${icon("info", 15)}<div><b>Confirm your email to start your trial.</b> <span class="muted">We sent you a link.</span> <button type="button" class="lnk" data-sendverify>Send it again</button></div></div>`;
+  if (b.mode === "read") return `<div class="billing-banner warn">${icon("info", 15)}<div><b>Read-only.</b> <span class="muted">${b.plan.status === "trialing" ? "Your trial has ended." : b.plan.status === "canceled" ? "Your subscription has ended." : "Payment didn't go through."} All your reports stay here; choose a plan to run new checks and drafts.</span>${link}</div></div>`;
+  if (b.mode === "manual") return `<div class="billing-banner warn">${icon("info", 15)}<div><b>Payment failed.</b> <span class="muted">Scheduled checks are paused until ${fmtDay(b.period.graceEndsAt)}. Update your payment in Razorpay to keep going.</span>${link}</div></div>`;
+  return "";
+}
+function paintBillingBanner() {
+  const el = $("#billBanner"); if (!el) return;
+  const html = billingBannerHtml(APP.cfg.billing);
+  el.innerHTML = html; el.hidden = !html;
+}
+
+let rzpLoading = null;
+function loadRazorpay() {
+  if (window.Razorpay) return Promise.resolve();
+  return (rzpLoading ||= new Promise((ok, bad) => { const s = document.createElement("script"); s.src = "https://checkout.razorpay.com/v1/checkout.js"; s.onload = ok; s.onerror = () => { rzpLoading = null; bad(new Error("Couldn't load Razorpay Checkout. Check your connection and try again.")); }; document.head.append(s); }));
+}
+async function startCheckout(plan) {
+  const co = await api("POST", "/api/billing/checkout", { plan, currency: BILL.currency });
+  await loadRazorpay();
+  const rzp = new window.Razorpay({
+    key: co.keyId, subscription_id: co.subscriptionId, name: "White Petal", description: `${co.name} · ${money(co.amount, co.currency)}/month${co.currency === "INR" ? " + GST" : ""}`,
+    prefill: { email: APP.user?.email || "" }, notes: { plan: co.plan }, theme: { color: "#F26B0F" },
+    // A hint only: the plan changes when the server hears from Razorpay.
+    handler: () => confirmPayment(co.plan),
+    modal: { ondismiss: () => toast("Checkout closed. Nothing was charged.") },
+  });
+  rzp.open();
+}
+async function confirmPayment(plan) {
+  BILL.confirming = plan; paintBilling();
+  const until = Date.now() + 120000;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, 3000));
+    try { BILL.d = await api("GET", "/api/billing"); } catch { continue; }
+    if (BILL.d.plan.code === plan && BILL.d.plan.status === "active") {
+      BILL.confirming = null; await reloadConfig(); paintBilling(); return toast(`You're on ${esc(BILL.d.plan.name)}. Thank you.`);
+    }
+  }
+  BILL.confirming = null; paintBilling();
+  toast("We haven't heard from Razorpay yet. If you were charged, your plan will update here shortly. Questions: support@perfstaq.com.");
+}
+$("#billing").addEventListener("click", async (e) => {
+  const t = e.target;
+  try {
+    const c = t.closest("[data-billcur]"); if (c) { BILL.currency = c.dataset.billcur; return paintBilling(); }
+    const co = t.closest("[data-checkout]"); if (co && co.getAttribute("aria-disabled") !== "true") { co.setAttribute("aria-disabled", "true"); try { await startCheckout(co.dataset.checkout); } finally { co.removeAttribute("aria-disabled"); } return; }
+    const ch = t.closest("[data-changeplan]");
+    if (ch) { BILL.d = await api("POST", "/api/billing/change-plan", { plan: ch.dataset.changeplan }); if (BILL.d.plan.pendingPlan) toast(`Switching at the end of this period (${fmtDay(BILL.d.period.end)}).`); else { toast("Upgrade requested. It unlocks as soon as Razorpay confirms the payment."); confirmPayment(ch.dataset.changeplan); } return paintBilling(); }
+    if (t.closest("[data-cancelplan]")) {
+      if (!BILL.cancelArmed) { BILL.cancelArmed = true; return paintBilling(); }
+      BILL.cancelArmed = false; BILL.d = await api("POST", "/api/billing/cancel"); toast(`Cancelled. You keep access until ${fmtDay(BILL.d.period.end)}.`); return paintBilling();
+    }
+    if (t.closest("[data-sendverify]")) { const r = await api("POST", "/api/auth/verify/send"); return toast(r.already ? "Your email is already confirmed." : `Sent to ${esc(APP.user.email)}.`); }
+  } catch (err) { if (!PLAN_LOCK_CODES.has(err.data?.code)) toast(esc(err.message)); }
+});
+$("#billBack").addEventListener("click", () => home());
+$("#navBilling").addEventListener("click", () => openBilling());
+
 /* =================================================================== LEAVING & COMING BACK */
 // No "leave site?" prompt: the run is saved continuously and this tab picks it back up by itself when you return.
 const AUTO = "wpetal:auto";
@@ -2246,6 +2443,7 @@ document.addEventListener("visibilitychange", () => {
   paintLanding();
   if (DATA.server()) { try { await DATA.refresh(); } catch {} }
   if (await handleAuthHash()) return;
+  if (peekPlanHint()) { if (DATA.server()) return openBilling(); if (APP.cfg.db) return showAuth("signup", null); }
   if (APP.cfg.engines && !APP.cfg.engines.length) $("#startErr").innerHTML = DATA.server() ? (canAdmin() ? `This organisation has no AI keys yet. Add them in <button type="button" class="lnk" id="toTeamKeys">Team &amp; keys</button>.` : "This organisation has no AI keys yet. Ask an admin to add them in Team & keys.") : "The server has no AI keys yet. Add GEMINI_API_KEY (free) in the environment variables.";
   // This tab was running a check when it navigated away or reloaded: carry on without asking.
   let auto = null; try { auto = sessionStorage.getItem(AUTO); sessionStorage.removeItem(AUTO); } catch {}
