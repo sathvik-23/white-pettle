@@ -474,3 +474,57 @@ test("billing: full lifecycle against a fake Razorpay; only signed events change
     for (const k of ["BILLING_ENABLED", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_PLAN_GROWTH_INR"]) delete process.env[k];
   }
 });
+
+test("billing: operator overrides are verified, expiring and audited; reconciliation repairs drift", { skip: !DB && "set TEST_DATABASE_URL" }, async () => {
+  const slug = (await call("lc", "GET", "/api/me")).data.org.slug;
+  const [org] = await sql(`select id from organizations where slug = $1`, [slug]);
+  const grant = { plan: "enterprise", overrides: { questions: 600, brands: 30 }, reason: "Signed enterprise order WP-2026-001", expiresAt: new Date(Date.now() + 365 * 864e5).toISOString() };
+  // Only a verified platform operator.
+  assert.equal((await call("lc", "POST", `/api/admin/orgs/${slug}/billing`, grant)).status, 404);
+  assert.equal((await call("evil", "POST", `/api/admin/orgs/${slug}/billing`, grant)).status, 404); // signed up as boss@x.co, never verified
+  // Reason, a future expiry and known entitlement keys are required.
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, reason: "" })).status, 400);
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, expiresAt: new Date(Date.now() - 1000).toISOString() })).status, 400);
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, expiresAt: undefined })).status, 400);
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, overrides: { magic: 1 } })).status, 400);
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, overrides: { questions: -5 } })).status, 400);
+  assert.equal((await call("op", "POST", `/api/admin/orgs/${slug}/billing`, { ...grant, plan: "platinum" })).status, 400);
+  const ok = await call("op", "POST", `/api/admin/orgs/${slug}/billing`, grant);
+  assert.equal(ok.status, 200);
+  let b = (await call("lc", "GET", "/api/billing")).data;
+  assert.equal(b.plan.code, "enterprise"); assert.equal(b.mode, "write"); assert.equal(b.entitlements.questions, 600); assert.equal(b.entitlements.brands, 30);
+  const [a] = await sql(`select user_id, detail from audit_log where org_id = $1 and action = 'billing.override' order by at desc limit 1`, [org.id]);
+  assert.ok(a.user_id); assert.equal(a.detail.reason, grant.reason); assert.equal(a.detail.before.plan, "growth"); assert.equal(a.detail.after.plan, "enterprise");
+  assert.deepEqual(a.detail.after.overrides, { questions: 600, brands: 30 });
+  // Expired: the override values and the operator-granted access stop on their own.
+  await sql(`update organizations set entitlement_overrides = jsonb_set(entitlement_overrides, '{expiresAt}', to_jsonb((now() - interval '1 minute')::text)), current_period_end = now() - interval '1 minute' where id = $1`, [org.id]);
+  b = (await call("lc", "GET", "/api/billing")).data;
+  assert.equal(b.entitlements.questions, 300); assert.equal(b.mode, "read");
+
+  // Reconciliation: a local copy left stale by a missed webhook is repaired from Razorpay, at most daily.
+  Object.assign(process.env, { RAZORPAY_KEY_ID: "rzp_test_key", RAZORPAY_KEY_SECRET: "rzp_secret_x", RAZORPAY_PLAN_GROWTH_INR: "plan_growth_inr" });
+  try {
+    const end = Date.now() + 30 * 864e5;
+    await sql(`update organizations set plan_code = 'growth', billing_status = 'past_due', grace_ends_at = now() + interval '1 day', razorpay_subscription_id = 'sub_recon_1', entitlement_overrides = '{}', current_period_end = now() + interval '1 day', billing_event_at = now() - interval '2 days' where id = $1`, [org.id]);
+    fakeRzp.fetchSubscription = async (id) => { fakeRzp.calls.push(["fetch", id]); return { id, plan_id: "plan_growth_inr", status: "active", current_start: unix(Date.now()), current_end: unix(end) }; };
+    const { reconcile } = await import("../../server/billing-routes.mjs");
+    const r = await reconcile({ limit: 50 });
+    assert.ok(r.checked >= 1);
+    b = (await call("lc", "GET", "/api/billing")).data;
+    assert.equal(b.plan.status, "active"); assert.ok(Math.abs(new Date(b.period.end) - end) < 2000);
+    assert.equal((await sql(`select count(*)::int as n from billing_events where org_id = $1 and event_type = 'reconcile' and status = 'processed'`, [org.id]))[0].n, 1);
+    // An older or shorter remote period never shortens a valid local one; and not again within a day.
+    fakeRzp.fetchSubscription = async (id) => ({ id, plan_id: "plan_growth_inr", status: "active", current_start: unix(Date.now() - 864e5), current_end: unix(Date.now() + 864e5) });
+    assert.equal((await reconcile({ limit: 50 })).checked, 0);
+    await sql(`update organizations set billing_reconciled_at = now() - interval '2 days' where id = $1`, [org.id]);
+    await reconcile({ limit: 50 });
+    assert.ok(Math.abs(new Date((await call("lc", "GET", "/api/billing")).data.period.end) - end) < 2000);
+  } finally { for (const k of ["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_PLAN_GROWTH_INR"]) delete process.env[k]; }
+
+  // The founder's cost view: plan, status, revenue, estimated cost and margin, labelled as estimates.
+  const ops = (await call("op", "GET", "/api/admin/orgs")).data;
+  const row = ops.orgs.find((x) => x.slug === slug);
+  assert.equal(row.plan_code, "growth"); assert.equal(row.billing_status, "active");
+  assert.equal(row.revenue_usd, 99); assert.ok(row.est_cost_usd > 0); assert.ok(row.margin_pct <= 100 && row.margin_pct > 0);
+  assert.equal(ops.estimates, true);
+});

@@ -13,7 +13,9 @@ export function accessMode(org, now = new Date()) {
   if (!org) return "read";
   const after = (t) => !!t && new Date(t) > now;
   switch (org.billing_status) {
-    case "internal": case "active": return "write";
+    case "internal": return "write";
+    // An operator's grant (an enterprise contract on invoice, a support recovery) ends at its expiry.
+    case "active": return org.entitlement_overrides?.grant && !after(org.entitlement_overrides.expiresAt) ? "read" : "write";
     case "trialing": return after(org.trial_ends_at) ? "write" : "read";
     case "past_due": return after(org.grace_ends_at) ? "manual" : "read";
     case "canceled": return after(org.current_period_end) ? "write" : "read";
@@ -108,6 +110,7 @@ export function applyEvent(org, evt, { planOf, now = new Date(), graceDays = 3 }
     if (periodEnd) patch.current_period_end = periodEnd;
     if (org.pending_plan_code === mapped.plan || org.pending_plan_code == null) patch.pending_plan_code = null;
     if (sub.customer_id) patch.razorpay_customer_id = sub.customer_id;
+    if (org.entitlement_overrides?.grant) patch.entitlement_overrides = {}; // a paid plan supersedes an operator's temporary grant
     return true;
   };
   switch (type) {

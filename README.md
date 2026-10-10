@@ -46,6 +46,16 @@ With a database, White Petal has accounts (email + password, or Sign in with Goo
 
 Runs live in Postgres, so a run started in one browser is there in another, and **scheduled checks** keep running with the tab closed: Cloud Scheduler calls `POST /api/cron/tick` every 10 minutes and the server runs every brand that is due on its organisation's keys, using the same handlers as a live run. "Queue a check now" starts one within about 10 minutes, so nobody has to keep a tab open. Without a database it still works as before, with everything kept in the browser.
 
+## Paid plans (Razorpay)
+
+Starter ($49 / ₹4,999), Growth ($99 / ₹9,999), Agency ($249 / ₹24,999) and Enterprise (from $999 / ₹99,999), monthly, plus GST in India. Off until `BILLING_ENABLED` is set; see [docs/razorpay-runbook.md](docs/razorpay-runbook.md) for test mode, release and rollback.
+
+- **The server decides.** `server/plans.mjs` holds the plans; `server/billing.mjs` checks brands, tracked questions (pooled on Agency), competitors, engines, schedules, samples, seats, integrations, action drafts and AI calls before any work, and the scheduler checks again at run time. Past a limit the API answers `402` with `code: "plan_limit"`, the limit, current use and the plan that unlocks it; nothing is charged automatically.
+- **Razorpay is the source of truth for payment.** Checkout sends only a plan and currency; the server picks the Razorpay plan id. A plan changes only when a signed webhook arrives (`POST /api/webhooks/razorpay`), recorded once per event id. A daily reconciliation repairs drift from a missed webhook, never shortening a paid period.
+- **States.** Existing organisations are `legacy` and keep full access. With `BILLING_ENABLED=1`, new self-serve sign-ups get a seven-day Growth trial (1 brand, 10 questions, ChatGPT/Perplexity/Gemini, two checks) that starts when the email is verified. A failed payment gives three days of grace with scheduled checks paused; cancellation keeps access to the end of the paid month. After a trial, grace or paid period ends, the organisation is read-only: every report stays readable, new checks, drafts and scheduled runs stop.
+- **Billing & usage** (sidebar) shows the plan, renewal or trial date, usage meters and the plan cards; owners and admins choose or change plans, owners cancel.
+- **Operators** see plan, revenue, estimated direct cost and margin for every organisation in Team & keys, and can set a plan with contract limits for a reason and until a date (expires on its own, written to the activity log).
+
 ## Integrations (all free)
 
 Connected per brand in **Settings**. Keys are encrypted at rest (AES-256-GCM with `APP_SECRET`).

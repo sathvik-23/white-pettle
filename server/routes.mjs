@@ -17,7 +17,8 @@ import { runCheck } from "./runner.mjs";
 import { slugify, emailOk, normEmail } from "./util.mjs";
 import * as O from "./orgs.mjs";
 import * as mail from "./mail.mjs";
-import { makeBillingRoutes } from "./billing-routes.mjs";
+import { makeBillingRoutes, reconcile } from "./billing-routes.mjs";
+import { PLANS } from "./plans.mjs";
 import * as B from "./billing.mjs";
 import { billingConfig } from "./razorpay.mjs";
 
@@ -181,6 +182,8 @@ async function integrationsFor(ws) {
 // minutes left of the budget, because Cloud Scheduler gives up on an HTTP target after 30 minutes.
 export async function tick({ budgetMs = 25 * 60000, log = console.log } = {}) {
   const until = Date.now() + budgetMs, done = [];
+  // Billing drift first: a small batch, each subscription at most once a day (see reconcile in billing-routes.mjs).
+  await reconcile({ limit: 20, log }).catch((e) => log(`[reconcile] ${e.message}`));
   while (Date.now() < until - 5 * 60000) {
     const ws = await one(`update workspaces set running_at = now()
       where id = (select id from workspaces where schedule <> 'off' and next_run_at <= now() and (running_at is null or running_at < now() - interval '45 minutes')
@@ -258,6 +261,19 @@ async function notifySlack(ws, s, prev) {
   await slack.notify(got.cfg, { title: `${ws.name}: weekly AI visibility`, lines: [`*Visibility* ${pct(s.visibility)}${d(s.visibility, prev?.visibility)}`, `*Score* ${s.score}/100 · *Share of voice* ${pct(s.sov)} · *Position* ${s.position ? "#" + s.position.toFixed(1) : "–"}`, s.leader ? `*Leader* ${s.leader.name} at ${pct(s.leader.vis)}` : ""].filter(Boolean), url: process.env.PUBLIC_ORIGIN || undefined });
 }
 
+// The founder's 90-day view: subscription revenue against estimated direct cost per organisation. Revenue is the
+// USD list price of a paying plan; cost is this month's metered AI spend plus the plan's payment (5%), infrastructure
+// and support/refund allowances. Estimates only: Razorpay and provider invoices are the real numbers.
+const PAYING = new Set(["active", "past_due", "canceled"]);
+function costRow(o) {
+  const plan = PLANS[o.plan_code], b = plan?.budget, paying = PAYING.has(o.billing_status) && (plan?.prices.USD || 0) > 0;
+  const revenue = paying ? plan.prices.USD / 100 : 0;
+  const cost = +(Number(o.spent || 0) + revenue * 0.05 + (paying && b ? b.infraUsd + b.supportUsd : 0)).toFixed(2);
+  const ov = o.entitlement_overrides || {};
+  return { ...o, entitlement_overrides: undefined, override: ov.values ? { reason: ov.reason, expiresAt: ov.expiresAt, by: ov.by, values: ov.values } : null,
+    revenue_usd: revenue, est_cost_usd: cost, cost_pct: revenue ? Math.round((100 * cost) / revenue) : null, margin_pct: revenue ? Math.round(100 - (100 * cost) / revenue) : null };
+}
+
 // Runs older than the plan's visible trend window are kept but not listed. $2 is the window in months (null: all).
 const WINDOW = `($2::int is null or r.started_at >= now() - make_interval(months => $2::int))`;
 const needDb = () => { if (!hasDb()) fail(400, "Accounts need a database (DATABASE_URL)."); };
@@ -267,7 +283,7 @@ const roleOk = (r) => O.ROLES.includes(r);
 // [method, pattern, handler(req, res, params, url)]. Patterns use :name segments.
 export const ROUTES = [
   // ── billing (first, so the webhook is matched before anything generic) ──
-  ...makeBillingRoutes({ needCtx }),
+  ...makeBillingRoutes({ needCtx, currentUser }),
   // ── accounts ──
   ["POST", "/api/auth/signup", async (req, res) => {
     needDb();
@@ -438,13 +454,13 @@ export const ROUTES = [
   }],
   ["GET", "/api/admin/orgs", async (req, res) => {
     const u = await needUser(req); if (!O.isOperator(u)) fail(404, "Not found");
-    const orgs = await q(`select o.slug, o.name, o.allow_platform_keys, o.monthly_cap_usd, o.created_at,
+    const orgs = await q(`select o.slug, o.name, o.allow_platform_keys, o.monthly_cap_usd, o.created_at, o.plan_code, o.billing_status, o.billing_currency, o.current_period_end, o.grace_ends_at, o.trial_ends_at, o.entitlement_overrides,
         (select count(*)::int from memberships m where m.org_id = o.id) as members,
         (select count(*)::int from workspaces w where w.org_id = o.id) as brands,
         (select u.email from memberships m join users u on u.id = m.user_id where m.org_id = o.id and m.role = 'owner') as owner,
         (select round(coalesce(sum(cost_usd), 0)::numeric, 2)::float from usage x where x.org_id = o.id and x.at >= date_trunc('month', now())) as spent
       from organizations o order by o.created_at desc limit 500`);
-    sendJson(res, 200, { orgs });
+    sendJson(res, 200, { orgs: orgs.map(costRow), estimates: true });
   }],
 
   // The current organisation: people, invites, keys, budget and usage.

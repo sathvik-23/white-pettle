@@ -71,6 +71,9 @@ test("billing states preserve reports but stop spend after grace", () => {
   assert.equal(accessMode({ billing_status: "canceled", current_period_end: "2026-10-11T00:00:00Z" }, now), "write");
   assert.equal(accessMode({ billing_status: "canceled", current_period_end: "2026-10-09T00:00:00Z" }, now), "read");
   assert.equal(accessMode({ billing_status: "paused" }, now), "read");
+  const grant = (expiresAt) => ({ billing_status: "active", entitlement_overrides: { grant: true, values: {}, expiresAt } });
+  assert.equal(accessMode(grant("2026-10-11T00:00:00Z"), now), "write");
+  assert.equal(accessMode(grant("2026-10-09T00:00:00Z"), now), "read");
   assert.equal(accessMode(null, now), "read");
 });
 

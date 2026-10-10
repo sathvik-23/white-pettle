@@ -6,7 +6,7 @@
 import { one, q, tx } from "./db.mjs";
 import { fail, sendJson, readJson, readBody, clientIp } from "./http.mjs";
 import { limited } from "./security.mjs";
-import { PLANS, SELF_SERVE, CURRENCIES, publicPlans } from "./plans.mjs";
+import { PLANS, SELF_SERVE, CURRENCIES, ENTITLEMENT_KEYS, publicPlans } from "./plans.mjs";
 import { billingState, applyEvent, eventSummary, nextPlan } from "./billing.mjs";
 import { verifyWebhook, planIdFor, billingConfig, client } from "./razorpay.mjs";
 import * as O from "./orgs.mjs";
@@ -43,7 +43,7 @@ function needCheckout(ctx) {
   return cfg;
 }
 
-export function makeBillingRoutes({ needCtx }) {
+export function makeBillingRoutes({ needCtx, currentUser }) {
   return [
     ["GET", "/api/billing/plans", async (req, res) => sendJson(res, 200, { plans: publicPlans().map((p) => ({ ...p, entitlements: finite(p.entitlements) })), monthlyOnly: true, currencies: CURRENCIES })],
     ["GET", "/api/billing", async (req, res) => sendJson(res, 200, await billingView(await needCtx(req, "viewer")))],
@@ -92,6 +92,7 @@ export function makeBillingRoutes({ needCtx }) {
     }],
 
     ["POST", "/api/webhooks/razorpay", webhook],
+    ["POST", "/api/admin/orgs/:org/billing", (req, res, p) => operatorGrant(req, res, p, currentUser)],
   ];
 }
 
@@ -142,4 +143,71 @@ async function webhook(req, res) {
     else console.error("[billing] webhook failed", eventId, e.message);
     fail(500, "Webhook processing failed; it will be retried.");
   }
+}
+
+// ── operator controls ────────────────────────────────────────────────────────
+// A verified platform operator may put an organisation on a plan with contract limits, for a reason and until a
+// date. The grant and its values stop applying on their own at expiry; every change is audited before/after.
+const NUMERIC = new Set(["brands", "questions", "competitorsPerBrand", "samples", "seats", "actionDrafts", "trendMonths", "baselineRuns"]);
+function checkOverrides(o) {
+  if (o == null) return {};
+  if (typeof o !== "object" || Array.isArray(o)) fail(400, "Overrides must be an object of entitlement limits.");
+  for (const [k, v] of Object.entries(o)) {
+    if (!ENTITLEMENT_KEYS.includes(k)) fail(400, `Unknown entitlement: ${k}.`);
+    if (NUMERIC.has(k) && !(Number.isInteger(v) && v >= 0 && v <= 100000)) fail(400, `${k} must be a whole number from 0.`);
+  }
+  return o;
+}
+export async function operatorGrant(req, res, p, currentUser) {
+  const u = await currentUser(req); if (!u || !O.isOperator(u)) fail(404, "Not found");
+  const b = await readJson(req, 20000);
+  const plan = String(b.plan || ""); if (!PLANS[plan] || plan === "trial") fail(400, "Choose legacy, starter, growth, agency or enterprise.");
+  const reason = String(b.reason || "").trim().slice(0, 300); if (reason.length < 3) fail(400, "Give a reason (for example, the signed order number).");
+  const expiresAt = b.expiresAt ? new Date(b.expiresAt) : null;
+  if (!expiresAt || Number.isNaN(+expiresAt) || expiresAt <= new Date()) fail(400, "Give an expiry date in the future.");
+  const values = checkOverrides(b.overrides);
+  const out = await tx(async (c) => {
+    const org = (await c.query(`select * from organizations where slug = $1 for update`, [p.org])).rows[0]; if (!org) fail(404, "Not found");
+    const overrides = { grant: plan !== "legacy", values, reason, expiresAt: expiresAt.toISOString(), by: u.email };
+    await c.query(`update organizations set plan_code = $2, billing_status = $3, entitlement_overrides = $4, current_period_start = now(), current_period_end = $5,
+                     grace_ends_at = null, pending_plan_code = null, updated_at = now() where id = $1`,
+      [org.id, plan, plan === "legacy" ? "internal" : "active", overrides, expiresAt]);
+    await c.query(`insert into audit_log (org_id, user_id, action, target, detail) values ($1, $2, 'billing.override', $3, $4)`, [org.id, u.id, org.name, {
+      reason, expiresAt: overrides.expiresAt,
+      before: { plan: org.plan_code, status: org.billing_status, overrides: org.entitlement_overrides?.values || {}, periodEnd: org.current_period_end },
+      after: { plan, status: plan === "legacy" ? "internal" : "active", overrides: values, periodEnd: overrides.expiresAt },
+    }]);
+    return { slug: org.slug, plan, expiresAt: overrides.expiresAt };
+  });
+  sendJson(res, 200, { ok: true, ...out });
+}
+
+// ── daily reconciliation ─────────────────────────────────────────────────────
+// A missed webhook must not leave permanent drift. A bounded batch of subscriptions not compared in the last day
+// is fetched from Razorpay and applied like an event: forward only, never shortening a paid period, and without
+// moving billing_event_at (so a real webhook created earlier but delivered later is still applied).
+const REMOTE = { active: "subscription.charged", pending: "subscription.halted", halted: "subscription.halted", cancelled: "subscription.cancelled", completed: "subscription.cancelled", expired: "subscription.cancelled", paused: "subscription.paused" };
+export async function reconcile({ limit = 20, log = () => {} } = {}) {
+  let rzp; try { rzp = client(); } catch { return { checked: 0, changed: 0 }; }
+  const due = await q(`select id, razorpay_subscription_id from organizations where razorpay_subscription_id is not null and billing_status in ('active','past_due')
+                       and (billing_reconciled_at is null or billing_reconciled_at < now() - interval '1 day') order by billing_reconciled_at nulls first limit $1`, [limit]);
+  let changed = 0;
+  for (const d of due) {
+    let sub; try { sub = await rzp.fetchSubscription(d.razorpay_subscription_id); } catch (e) { log(`[reconcile] ${d.razorpay_subscription_id}: ${e.message}`); continue; }
+    await tx(async (c) => {
+      const org = (await c.query(`select * from organizations where id = $1 for update`, [d.id])).rows[0];
+      const type = REMOTE[sub.status];
+      const r = type ? applyEvent({ ...org, billing_event_at: null }, { event: type, created_at: Math.floor(Date.now() / 1000), payload: { subscription: { entity: sub } } }, { planOf, graceDays: billingConfig().graceDays }) : { status: "ignored", patch: {} };
+      const patch = { ...r.patch }; delete patch.billing_event_at;
+      const same = (k) => (k === "current_period_end" ? +new Date(patch[k]) === +new Date(org[k]) : patch[k] === org[k]);
+      const drift = ["plan_code", "billing_status", "current_period_end"].some((k) => k in patch && !same(k));
+      patch.billing_reconciled_at = new Date();
+      const keys = Object.keys(patch);
+      await c.query(`update organizations set ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")} where id = $1`, [org.id, ...keys.map((k) => patch[k])]);
+      await c.query(`insert into billing_events (event_id, event_type, org_id, status, processed_at, payload) values ($1, 'reconcile', $2, $3, now(), $4) on conflict (event_id) do nothing`,
+        [`reconcile:${org.razorpay_subscription_id}:${Date.now()}`, org.id, drift ? "processed" : "ignored", { remote: { status: sub.status, plan_id: sub.plan_id, current_end: sub.current_end }, local: { plan: org.plan_code, status: org.billing_status } }]);
+      if (drift) { changed++; await c.query(`insert into audit_log (org_id, action, target, detail) values ($1, 'billing.reconciled', $2, $3)`, [org.id, org.razorpay_subscription_id, { from: { plan: org.plan_code, status: org.billing_status }, to: { plan: patch.plan_code || org.plan_code, status: patch.billing_status || org.billing_status } }]); }
+    });
+  }
+  return { checked: due.length, changed };
 }
