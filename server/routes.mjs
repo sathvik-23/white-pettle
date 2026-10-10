@@ -11,20 +11,37 @@ import * as google from "./integrations/google.mjs";
 import * as serp from "./integrations/serp.mjs";
 import * as entity from "./integrations/entity.mjs";
 import * as slack from "./integrations/slack.mjs";
-import { serpConfig, env } from "../api/_lib.js";
+import { serpConfig, env, engines as availableEngines } from "../api/_lib.js";
 import { summarize, hostOf } from "./metrics.mjs";
 import { runCheck } from "./runner.mjs";
 import { slugify, emailOk, normEmail } from "./util.mjs";
 import * as O from "./orgs.mjs";
 import * as mail from "./mail.mjs";
 import { makeBillingRoutes } from "./billing-routes.mjs";
+import * as B from "./billing.mjs";
+import { billingConfig } from "./razorpay.mjs";
 
 const SESSION = "wp_session";
 const GSTATE = "wp_gstate";
 const DAY = 864e5;
-const nextRun = (schedule, from = Date.now()) => (schedule === "daily" ? new Date(from + DAY) : schedule === "weekly" ? new Date(from + 7 * DAY) : null);
+const nextRun = (schedule, from = Date.now()) => (["daily", "rotating"].includes(schedule) ? new Date(from + DAY) : schedule === "weekly" ? new Date(from + 7 * DAY) : null);
+const ROTATION_SIZE = 5; // questions in a rotating daily check
 const personalOrgName = (u) => `${(u.name || "").trim() || u.email.split("@")[0]}'s brands`;
 const platformKeysForSignups = () => process.env.PLATFORM_KEYS_FOR_SIGNUPS !== "0";
+
+// Paid plans: once self-serve billing is on (BILLING_ENABLED=1), a new personal organisation starts as a capped
+// Growth trial; until then, and for invited or operator-made organisations, it stays legacy/internal. The trial's
+// seven days start when the address is proved (an emailed link or a verified Google sign-in), not at sign-up.
+const trialsOn = () => billingConfig().enabled === "1";
+async function makeTrial(orgId, verified) {
+  await q(`update organizations set plan_code = 'trial', billing_status = 'trialing' where id = $1`, [orgId]);
+  if (verified) await startTrial({ orgId });
+}
+async function startTrial({ orgId = null, userId = null }) {
+  const days = billingConfig().trialDays;
+  await q(`update organizations set trial_started_at = now(), trial_ends_at = now() + make_interval(days => $3::int), updated_at = now()
+           where billing_status = 'trialing' and trial_started_at is null and (id = $1 or ($1::uuid is null and created_by = $2))`, [orgId, userId, days]);
+}
 
 // ── sessions and context ────────────────────────────────────────────────────
 export async function currentUser(req) {
@@ -170,6 +187,17 @@ export async function tick({ budgetMs = 25 * 60000, log = console.log } = {}) {
                   order by next_run_at limit 1 for update skip locked)
       returning *`);
     if (!ws) break;
+    // The plan first: no unattended spend after a trial, in grace, when read-only, or on a schedule the plan
+    // no longer includes. Checked here, at run time, not only when the schedule was set.
+    let plan;
+    try { plan = await B.scheduledPlan(ws.org_id, ws); }
+    catch (e) {
+      const reason = e.extra?.code === "plan_limit" ? "plan_limit" : e.extra?.code || "billing";
+      log(`[tick ${ws.slug}] skipped: ${reason}`);
+      await q(`update workspaces set running_at = null, next_run_at = now() + interval '1 day' where id = $1`, [ws.id]);
+      await O.audit(ws.org_id, null, "check.skipped", ws.name, { reason, capability: e.extra?.capability || null });
+      continue;
+    }
     const budget = await O.capState(ws.org_id);
     if (budget.over) {
       log(`[tick ${ws.slug}] skipped: monthly AI budget reached`);
@@ -180,11 +208,14 @@ export async function tick({ budgetMs = 25 * 60000, log = console.log } = {}) {
     const prev = await one(`select data from runs where workspace_id = $1 and status = 'done' order by started_at desc limit 1`, [ws.id]);
     const prevSummary = prev?.data ? summarize(prev.data) : null;
     let M = null, err = null;
+    const scope = scheduledScope(ws, plan.entitlements);
     try {
       const keys = O.envFor(await O.orgKeys(ws.org_id));
       // Stop asking once this run's estimated cost would pass what's left of the monthly budget.
       const budgetUsd = budget.cap == null ? null : Math.max(0, budget.cap - budget.spent);
-      M = await O.withEnv(keys, () => runCheck(ws, { prev: prev?.data, deadline: until - 60000, budgetUsd, costOf: O.costOf, log: (m) => log(`[tick ${ws.slug}] ${m}`) }));
+      M = await O.withEnv(keys, () => runCheck(scope.ws, { prev: prev?.data, deadline: until - 60000, budgetUsd, costOf: O.costOf, samples: scope.samples,
+        engines: availableEngines().filter((e) => plan.entitlements.engines.includes(e)), log: (m) => log(`[tick ${ws.slug}] ${m}`) }));
+      if (M && scope.partial) M.partial = { rotation: true, questions: scope.ws.setup.questions.length };
     } catch (e) { err = String(e.message || e); log(`[tick ${ws.slug}] failed: ${err}`); }
     if (M) {
       const s = summarize(M);
@@ -194,11 +225,23 @@ export async function tick({ budgetMs = 25 * 60000, log = console.log } = {}) {
       await notifySlack(ws, s, prevSummary).catch(() => {});
       done.push({ slug: ws.slug, visibility: s.visibility, score: s.score });
     }
-    await q(`update workspaces set running_at = null, last_run_at = case when $2 then now() else last_run_at end, next_run_at = $3, updated_at = now() where id = $1`,
-      [ws.id, !!M, nextRun(ws.schedule) || null]);
+    await q(`update workspaces set running_at = null, last_run_at = case when $2 then now() else last_run_at end, next_run_at = $3, updated_at = now(),
+               rotation_cursor = $4, last_full_run_at = case when $2 and $5 then now() else last_full_run_at end where id = $1`,
+      [ws.id, !!M, nextRun(ws.schedule) || null, M ? scope.cursor : ws.rotation_cursor, !scope.partial]);
     if (err) await q(`insert into runs (id, workspace_id, source, status, error, finished_at) values ($1, $2, 'scheduled', 'failed', $3, now())`, [randomId(9), ws.id, err]);
   }
   return done;
+}
+// What an unattended run may spend: active questions up to the plan's limit, its samples, and for a rotating
+// schedule a few priority questions a day with a full run once a week.
+export function scheduledScope(ws, ent, now = Date.now()) {
+  const all = (ws.setup?.questions || []).filter((x) => x && x.on !== false).slice(0, Number.isFinite(ent.questions) ? ent.questions : undefined);
+  const samples = Math.min(ws.samples || 1, ent.samples || 1);
+  const full = ws.schedule !== "rotating" || !ws.last_full_run_at || now - new Date(ws.last_full_run_at) >= 7 * DAY;
+  if (full || all.length <= ROTATION_SIZE) return { ws: { ...ws, setup: { ...ws.setup, questions: all } }, samples, partial: false, cursor: ws.rotation_cursor || 0 };
+  const start = (ws.rotation_cursor || 0) % all.length;
+  const pick = Array.from({ length: ROTATION_SIZE }, (_, i) => all[(start + i) % all.length]);
+  return { ws: { ...ws, setup: { ...ws.setup, questions: pick } }, samples, partial: true, cursor: (start + ROTATION_SIZE) % all.length };
 }
 // A scheduled run calls the engines in-process, so its usage is counted from the finished run.
 async function meterRun(ws, M) {
@@ -215,6 +258,8 @@ async function notifySlack(ws, s, prev) {
   await slack.notify(got.cfg, { title: `${ws.name}: weekly AI visibility`, lines: [`*Visibility* ${pct(s.visibility)}${d(s.visibility, prev?.visibility)}`, `*Score* ${s.score}/100 · *Share of voice* ${pct(s.sov)} · *Position* ${s.position ? "#" + s.position.toFixed(1) : "–"}`, s.leader ? `*Leader* ${s.leader.name} at ${pct(s.leader.vis)}` : ""].filter(Boolean), url: process.env.PUBLIC_ORIGIN || undefined });
 }
 
+// Runs older than the plan's visible trend window are kept but not listed. $2 is the window in months (null: all).
+const WINDOW = `($2::int is null or r.started_at >= now() - make_interval(months => $2::int))`;
 const needDb = () => { if (!hasDb()) fail(400, "Accounts need a database (DATABASE_URL)."); };
 const roleOk = (r) => O.ROLES.includes(r);
 
@@ -248,6 +293,7 @@ export const ROUTES = [
     } else {
       u = await one(`insert into users (email, name, pw_hash, last_login_at) values ($1, $2, $3, now()) returning id, email, name, email_verified_at`, [email, name, pw]);
       orgId = (await O.createOrg({ name: personalOrgName(u), by: u.id, allowPlatformKeys: platformKeysForSignups() })).id;
+      if (trialsOn()) await makeTrial(orgId, false);
       emailLink(req, u, "verify").catch((e) => console.warn("[verify]", e.message));
     }
     sendJson(res, 200, { user: publicUser(u) }, { "set-cookie": await startSession(req, u.id, orgId) });
@@ -289,6 +335,7 @@ export const ROUTES = [
     // The emailed link also proves the address.
     await q(`update users set pw_hash = $2, last_login_at = now(), email_verified_at = coalesce(email_verified_at, now()) where id = $1`, [userId, await hashPassword(b.password)]);
     await q(`delete from sessions where user_id = $1`, [userId]); // signed out everywhere else
+    await startTrial({ userId });
     const u = await one(`select id, email, name, email_verified_at from users where id = $1`, [userId]);
     sendJson(res, 200, { user: publicUser(u) }, { "set-cookie": await startSession(req, u.id) });
   }],
@@ -300,6 +347,7 @@ export const ROUTES = [
     const userId = await useToken(b.token, "verify");
     if (!userId) fail(400, "This verification link has expired or was already used. Send a new one from Team & keys.");
     await q(`update users set email_verified_at = coalesce(email_verified_at, now()) where id = $1`, [userId]);
+    await startTrial({ userId });
     sendJson(res, 200, { ok: true });
   }],
   ["POST", "/api/auth/verify/send", async (req, res) => {
@@ -339,7 +387,7 @@ export const ROUTES = [
       if (u && !u.email_verified_at) { await q(`update users set pw_hash = null where id = $1`, [u.id]); await q(`delete from sessions where user_id = $1`, [u.id]); }
     }
     let orgId = null;
-    if (u) await q(`update users set google_sub = coalesce(google_sub, $2), email_verified_at = coalesce(email_verified_at, now()), last_login_at = now() where id = $1`, [u.id, g.sub]);
+    if (u) { await q(`update users set google_sub = coalesce(google_sub, $2), email_verified_at = coalesce(email_verified_at, now()), last_login_at = now() where id = $1`, [u.id, g.sub]); await startTrial({ userId: u.id }); }
     else {
       if (invite && normEmail(invite.email) !== g.email) return back(`This invite is for ${invite.email}, but you signed in to Google as ${g.email}.`);
       if (!invite && process.env.ACCESS_CODE) return back(`New accounts need an invite. Ask your admin to invite ${g.email}.`);
@@ -349,6 +397,7 @@ export const ROUTES = [
       } else {
         u = await one(`insert into users (email, name, google_sub, email_verified_at, last_login_at) values ($1, $2, $3, now(), now()) returning id, email, name`, [g.email, g.name, g.sub]);
         orgId = (await O.createOrg({ name: personalOrgName(u), by: u.id, allowPlatformKeys: platformKeysForSignups() })).id;
+        if (trialsOn()) await makeTrial(orgId, true);
       }
     }
     if (invite && !orgId) { try { orgId = (await O.acceptInvite(invite, u)).orgId; } catch (e) { return back(e.message); } }
@@ -409,6 +458,7 @@ export const ROUTES = [
       invites: admin ? await O.pendingInvites(id) : [],
       keys: admin ? O.keyStatus(await O.orgKeys(id)) : null,
       usage: admin ? await O.usageSummary(id) : { cap: await O.capState(id) },
+      billing: await B.billingSummary(id),
     });
   }],
   ["PATCH", "/api/org", async (req, res) => {
@@ -440,6 +490,7 @@ export const ROUTES = [
     }
     if (await one(`select 1 from memberships m join users u on u.id = m.user_id where m.org_id = $1 and u.email = $2`, [ctx.org.id, email])) fail(409, `${email} is already in this organisation.`);
     if (limited("invite:" + ctx.org.id, 30, 3600e3)) fail(429, "That's a lot of invites in an hour. Try again later.");
+    await B.assertSeatInvite(ctx.org.id);
     sendJson(res, 200, { invite: await sendInvite(req, ctx.user, ctx.org, email, role), invites: await O.pendingInvites(ctx.org.id) });
   }],
   ["DELETE", "/api/org/invitations/:id", async (req, res, p) => {
@@ -513,14 +564,17 @@ export const ROUTES = [
   // Brands in the current organisation, with their recent trend, for the switcher and the brand list.
   ["GET", "/api/workspaces", async (req, res) => {
     const ctx = await needCtx(req, "viewer");
-    const rows = await q(`select w.*, (select coalesce(json_agg(t order by t.started_at), '[]') from (select id, started_at, source, summary from runs r where r.workspace_id = w.id and r.status = 'done' order by r.started_at desc limit 12) t) as trend
-                           from workspaces w where org_id = $1 order by updated_at desc`, [ctx.org.id]);
+    const rows = await q(`select w.*, (select coalesce(json_agg(t order by t.started_at), '[]') from (select id, started_at, source, summary from runs r where r.workspace_id = w.id and r.status = 'done' and ${WINDOW} order by r.started_at desc limit 12) t) as trend
+                           from workspaces w where org_id = $1 order by updated_at desc`, [ctx.org.id, await B.trendMonths(ctx.org.id)]);
     sendJson(res, 200, { workspaces: rows.map((w) => wsOut(w, { trend: w.trend, setup: w.setup })), org: O.orgOut(ctx) });
   }],
   ["PUT", "/api/workspaces/:slug", async (req, res, p) => {
     const ctx = await needCtx(req, "editor"); const b = await readJson(req);
     const slug = slugify(p.slug), name = String(b.name || b.setup?.profile?.name || slug).slice(0, 120);
     const setup = b.setup || {};
+    const prev = await one(`select id, setup from workspaces where org_id = $1 and slug = $2`, [ctx.org.id, slug]);
+    if (!prev) await B.assertBrandCreate(ctx.org.id);
+    await B.assertWorkspaceSetup(ctx.org.id, setup, { prev: prev?.setup, workspaceId: prev?.id });
     const w = await one(`insert into workspaces (org_id, owner_id, slug, name, site, setup) values ($1, $2, $3, $4, $5, $6)
       on conflict (org_id, slug) do update set name = excluded.name, site = excluded.site, setup = excluded.setup, updated_at = now() returning *`, [ctx.org.id, ctx.user.id, slug, name, b.site || setup.profile?.site || null, setup]);
     sendJson(res, 200, { workspace: wsOut(w, { setup: w.setup }) });
@@ -534,14 +588,18 @@ export const ROUTES = [
       const mine = to && (await one(`select role from memberships where org_id = $1 and user_id = $2`, [to.id, ctx.user.id]));
       if (!to || !((mine && O.can(mine.role, "admin")) || ctx.operator)) fail(403, "You need to be an admin in the organisation you're moving it to.");
       if (await one(`select 1 from workspaces where org_id = $1 and slug = $2`, [to.id, w.slug])) fail(409, `${to.name} already has a brand called ${w.slug}.`);
+      await B.assertBrandCreate(to.id);
       await q(`update workspaces set org_id = $2, updated_at = now() where id = $1`, [w.id, to.id]);
       await O.audit(ctx.org.id, ctx.user.id, "brand.moved_out", w.name, { to: to.slug });
       await O.audit(to.id, ctx.user.id, "brand.moved_in", w.name, { from: ctx.org.slug });
       return sendJson(res, 200, { moved: { slug: w.slug, to: to.slug } });
     }
-    const schedule = ["off", "daily", "weekly"].includes(b.schedule) ? b.schedule : w.schedule;
+    const schedule = ["off", "daily", "weekly", "rotating"].includes(b.schedule) ? b.schedule : w.schedule;
     const samples = b.samples != null ? Math.max(1, Math.min(5, Number(b.samples) || 1)) : w.samples;
     const setup = b.setup ? { ...w.setup, ...b.setup } : w.setup;
+    if (schedule !== w.schedule || samples > w.samples) await B.assertSchedule(ctx.org.id, schedule !== w.schedule ? schedule : null, samples > w.samples ? samples : null);
+    if (b.setup) await B.assertWorkspaceSetup(ctx.org.id, setup, { prev: w.setup, workspaceId: w.id });
+    if (b.runNow) await B.assertNewRun(ctx.org.id);
     // A new or changed schedule starts from now: the next run is one period away, or "soon" if asked (runNow).
     const next = b.runNow ? new Date() : schedule === w.schedule && w.next_run_at ? w.next_run_at : nextRun(schedule);
     const out = await one(`update workspaces set schedule = $2, samples = $3, setup = $4, next_run_at = $5, name = coalesce($6, name), updated_at = now() where id = $1 returning *`,
@@ -559,7 +617,7 @@ export const ROUTES = [
   // Runs: the browser saves its live run as it goes; scheduled runs arrive from the tick.
   ["GET", "/api/workspaces/:slug/runs", async (req, res, p) => {
     const ctx = await needCtx(req, "viewer"); const w = await needWorkspace(ctx, p.slug);
-    const runs = await q(`select id, source, status, started_at, finished_at, summary, error from runs where workspace_id = $1 order by started_at desc limit 60`, [w.id]);
+    const runs = await q(`select id, source, status, started_at, finished_at, summary, error from runs r where workspace_id = $1 and ${WINDOW} order by started_at desc limit 60`, [w.id, await B.trendMonths(ctx.org.id)]);
     sendJson(res, 200, { runs });
   }],
   ["GET", "/api/workspaces/:slug/runs/latest", async (req, res, p) => {
@@ -579,6 +637,7 @@ export const ROUTES = [
     const data = b.data || {}; const status = data.finishedAt ? "done" : b.status === "stopped" ? "stopped" : "running";
     const owner = await one(`select workspace_id from runs where id = $1`, [p.id]);
     if (owner && owner.workspace_id !== w.id) fail(409, "That run id belongs to another brand.");
+    if (!owner) await B.assertNewRun(ctx.org.id);
     await q(`insert into runs (id, workspace_id, source, status, started_at, finished_at, summary, data, started_by, updated_at)
              values ($1, $2, 'live', $3, to_timestamp($4 / 1000.0), $5, $6, $7, $8, now())
              on conflict (id) do update set status = excluded.status, finished_at = excluded.finished_at, summary = excluded.summary, data = excluded.data, updated_at = now()`,
@@ -595,6 +654,7 @@ export const ROUTES = [
   ["PUT", "/api/workspaces/:slug/integrations/:provider", async (req, res, p) => {
     const ctx = await needCtx(req, "admin"); const w = await needWorkspace(ctx, p.slug, "admin"); const mod = getProvider(p.provider);
     if (!mod || p.provider === "serp") fail(404, "Unknown integration.");
+    await B.assertIntegration(ctx.org.id, p.provider);
     const b = await readJson(req, 50000);
     const prev = (await integrationCfg(w, p.provider))?.cfg || {};
     const cfg = { ...prev };
@@ -615,12 +675,14 @@ export const ROUTES = [
   }],
   ["POST", "/api/workspaces/:slug/integrations/:provider/collect", async (req, res, p) => {
     const ctx = await needCtx(req, "editor"); const w = await needWorkspace(ctx, p.slug, "editor");
+    await B.assertIntegration(ctx.org.id, p.provider);
     sendJson(res, 200, { data: await collectOne(w, p.provider), integrations: await integrationsFor(w) });
   }],
   // Push changed pages to Bing (and so ChatGPT search) right away: IndexNow and/or Bing's URL submission.
   ["POST", "/api/workspaces/:slug/integrations/:provider/submit", async (req, res, p) => {
     const ctx = await needCtx(req, "editor"); const w = await needWorkspace(ctx, p.slug, "editor"); const b = await readJson(req, 200000);
     if (!["indexnow", "bing"].includes(p.provider)) fail(400, "This tool can't submit URLs.");
+    await B.assertIntegration(ctx.org.id, p.provider);
     const got = await integrationCfg(w, p.provider); if (!got) fail(404, "Not connected.");
     const urls = (b.urls || []).map(String).filter((x) => /^https?:\/\//.test(x)).slice(0, 500);
     if (!urls.length) fail(400, "No URLs to submit.");
@@ -638,6 +700,7 @@ export const ROUTES = [
   // Google OAuth (Search Console + GA4). The state row ties the callback to this user and brand, once.
   ["GET", "/api/oauth/google/start", async (req, res, p, url) => {
     const ctx = await needCtx(req, "admin"); const w = await needWorkspace(ctx, url.searchParams.get("ws") || "", "admin");
+    await B.assertIntegration(ctx.org.id, "google");
     if (!process.env.GOOGLE_OAUTH_CLIENT_ID) fail(400, "Google sign-in isn't configured on this server (GOOGLE_OAUTH_CLIENT_ID).");
     const state = randomId(18);
     await q(`insert into oauth_states (state, user_id, workspace_id) values ($1, $2, $3)`, [state, ctx.user.id, w.id]);
@@ -662,6 +725,7 @@ export const ROUTES = [
   // Live checks the browser pipeline needs from the server (keys stay server-side, the organisation's own).
   ["POST", "/api/serp/organic", async (req, res) => {
     const ctx = await aiContext(req, "editor");
+    if (ctx) await B.assertAi(ctx.org.id, { kind: "serp" });
     const run = async () => {
       const cfg = serpConfig(); if (!cfg) fail(400, "Google rank checks need a DataForSEO login or a SerpApi key (Team & keys).");
       const b = await readJson(req, 20000);
@@ -674,6 +738,7 @@ export const ROUTES = [
   }],
   ["POST", "/api/entity", async (req, res) => {
     const ctx = await aiContext(req, "editor");
+    if (ctx) await B.assertAi(ctx.org.id, { kind: "entity" });
     const b = await readJson(req, 100000);
     const run = async () => sendJson(res, 200, await entity.collect({ googleApiKey: env("GOOGLE_API_KEY") }, { brand: String(b.name || ""), host: hostOf(b.site || ""), site: b.site, orgSchema: b.orgSchema }));
     return ctx ? O.withOrgKeys(ctx.org.id, run) : run();

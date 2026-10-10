@@ -12,6 +12,7 @@ import { ROUTES, aiAuth, aiAllow, currentUser, isLocalDev } from "./routes.mjs";
 import * as O from "./orgs.mjs";
 import { HttpError, sendJson, readBody, fail } from "./http.mjs";
 import { limited } from "./security.mjs";
+import * as B from "./billing.mjs";
 
 // The original AI handlers. They spend money, so the server gates them: an editor in an organisation, inside its
 // monthly budget (with a database), or the access code (without one). They also run their own ACCESS_CODE guard,
@@ -64,8 +65,12 @@ async function handleAi(req, res, name, url) {
   const chat = name === "write" && body.kind === "chat";
   if (who && chat && !O.can(who.role, "editor") && limited("chat:" + who.user.id, 40, 3600e3)) fail(429, "That's a lot of questions for one hour. Try again a bit later.");
   const ctx = await aiAllow(who, req, chat ? "viewer" : "editor");
+  // The plan decides before anything is forwarded: read-only states, engines outside the plan, drafts past the allowance.
+  const engine = name === "ask" ? String(body.engine || "") || null : null;
+  const draft = name === "write" && B.DRAFT_KINDS.has(body.kind);
+  if (ctx) await B.assertAi(ctx.org.id, { kind: name, engine, draft });
   const run = async () => {
-    if (ctx) O.meter({ orgId: ctx.org.id, workspaceId: ctx.workspaceId, userId: ctx.user.id, kind: name, engine: name === "ask" ? String(body.engine || "") || null : null, bytes: raw.length });
+    if (ctx) O.meter({ orgId: ctx.org.id, workspaceId: ctx.workspaceId, userId: ctx.user.id, kind: draft ? "draft" : name, engine, bytes: raw.length });
     const headers = { ...req.headers }; if (process.env.ACCESS_CODE) headers["x-access-code"] = process.env.ACCESS_CODE;
     const request = new Request(url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : raw });
     const out = await (await aiHandler(name))(request);
@@ -87,10 +92,11 @@ async function sendConfig(req, res, url) {
   const get = async () => (await (await aiHandler("config"))(new Request(url))).json();
   const cfg = ctx?.org ? await O.withOrgKeys(ctx.org.id, get) : await get();
   const budget = ctx?.org ? await O.capState(ctx.org.id) : null;
+  const billing = ctx?.org ? await B.billingSummary(ctx.org.id) : null;
   return sendJson(res, 200, { ...cfg, db: hasDb(), auth: hasDb(), access: hasDb() || isLocalDev(req) ? false : cfg.access, invite: hasDb() && !!process.env.ACCESS_CODE,
     user: user ? { id: user.id, email: user.email, name: user.name, verified: !!user.email_verified_at } : null,
     org: ctx ? O.orgOut(ctx) : null, orgs: ctx ? ctx.orgs.map((o) => ({ slug: o.slug, name: o.name, role: o.role })) : [], operator: !!ctx?.operator,
-    budget: budget ? { warn: budget.warn, over: budget.over, pct: budget.pct } : null,
+    budget: budget ? { warn: budget.warn, over: budget.over, pct: budget.pct } : null, billing,
     googleLogin: hasDb() && !!(process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET),
     serp: cfg.engines.includes("aio"), googleOAuth: !!process.env.GOOGLE_OAUTH_CLIENT_ID, version: process.env.K_REVISION || "dev" });
 }

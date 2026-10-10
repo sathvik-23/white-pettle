@@ -145,3 +145,95 @@ export function eventSummary(evt) {
     ...(p ? { payment: { id: p.id, status: p.status, amount: p.amount, currency: p.currency, invoice_id: p.invoice_id } } : {}),
   };
 }
+
+// ── assertions at the cost boundaries ────────────────────────────────────────
+// Each loads the organisation's state, refuses read-only use, and throws a structured plan_limit error when the
+// change would go past the plan. Reductions are always allowed, so an organisation over its limit after a
+// downgrade can get back under it.
+const activeQuestions = (setup) => (setup?.questions || []).filter((x) => x && x.on !== false).length;
+const limitError = (state, capability, used, limit) => planError(capability, used, limit, nextPlan(state.org.plan_code), state.period.end);
+const allowsIntegration = (e, provider) => e.integrations === "all" || (Array.isArray(e.integrations) && e.integrations.includes(provider));
+
+export async function assertBrandCreate(orgId) {
+  const state = await requireMode(orgId);
+  if (state.usage.brands >= state.entitlements.brands) throw limitError(state, "brands", state.usage.brands, state.entitlements.brands);
+  return state;
+}
+
+// `prev` is the brand's current setup when it is being edited, so only growth past the plan is refused.
+export async function assertWorkspaceSetup(orgId, setup, { prev = null, workspaceId = null } = {}) {
+  const state = await requireMode(orgId);
+  const e = state.entitlements, mine = activeQuestions(setup), before = prev ? activeQuestions(prev) : 0;
+  // Questions are pooled across the organisation's brands (Agency: 100 across five).
+  const others = state.usage.questions - (workspaceId ? before : 0);
+  if (mine > before && others + mine > e.questions) throw limitError(state, "questions", others + mine, e.questions);
+  const comps = (setup?.profile?.competitors || []).length, compsBefore = (prev?.profile?.competitors || []).length;
+  if (comps > compsBefore && comps > e.competitorsPerBrand) throw limitError(state, "competitors", comps, e.competitorsPerBrand);
+  const blocked = (setup?.engines || []).filter((x) => !e.engines.includes(x) && !(prev?.engines || []).includes(x));
+  if (blocked.length) throw limitError(state, "engines", blocked.join(", "), e.engines.join(", "));
+  return state;
+}
+
+export async function assertSchedule(orgId, schedule, samples) {
+  const state = await requireMode(orgId);
+  if (schedule != null && !state.entitlements.schedule.includes(schedule)) throw limitError(state, "schedule", schedule, state.entitlements.schedule.join(" or "));
+  if (samples != null && samples > state.entitlements.samples) throw limitError(state, "samples", samples, state.entitlements.samples);
+  return state;
+}
+
+export async function assertSeatInvite(orgId) {
+  const state = await requireMode(orgId);
+  if (state.usage.seats >= state.entitlements.seats) throw limitError(state, "seats", state.usage.seats, state.entitlements.seats);
+  return state;
+}
+
+export async function assertIntegration(orgId, provider) {
+  const state = await requireMode(orgId);
+  if (!allowsIntegration(state.entitlements, provider)) throw limitError(state, "integrations", provider, Array.isArray(state.entitlements.integrations) ? state.entitlements.integrations.join(", ") || "none" : state.entitlements.integrations);
+  return state;
+}
+
+// A trial includes a fixed number of checks (a baseline and a re-check).
+export async function assertNewRun(orgId) {
+  const state = await requireMode(orgId);
+  const n = state.entitlements.baselineRuns;
+  if (n != null && state.usage.runs >= n) throw limitError(state, "baselineRuns", state.usage.runs, n);
+  return state;
+}
+
+// Generated action drafts: pages, rewrites and outreach pitches. Counted per period from the usage table.
+export const DRAFT_KINDS = new Set(["pitch", "article", "fixpack"]);
+export async function assertAi(orgId, { kind, engine, draft = false, scheduled = false }) {
+  const state = await requireMode(orgId, scheduled ? "scheduled" : "manual");
+  const e = state.entitlements;
+  if (engine && !e.engines.includes(engine)) throw limitError(state, "engines", engine, e.engines.join(", "));
+  if (draft && state.usage.actionDrafts >= e.actionDrafts) throw limitError(state, "actionDrafts", state.usage.actionDrafts, e.actionDrafts);
+  return state;
+}
+
+// For the scheduler: may this brand run unattended now, and with what? Throws like the others.
+export async function scheduledPlan(orgId, ws) {
+  const state = await requireMode(orgId, "scheduled");
+  const e = state.entitlements;
+  if (!e.schedule.includes(ws.schedule)) throw limitError(state, "schedule", ws.schedule, e.schedule.join(" or "));
+  return state;
+}
+
+// The safe summary the browser gets with /api/config.
+export async function billingSummary(orgId) {
+  const state = await billingState(orgId);
+  const finite = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v === Infinity ? null : v]));
+  return {
+    plan: { code: state.org.plan_code, name: PLANS[state.org.plan_code]?.name, status: state.org.billing_status, currency: state.org.billing_currency },
+    mode: state.mode,
+    period: { start: state.org.current_period_start, end: state.org.current_period_end, trialEndsAt: state.org.trial_ends_at, graceEndsAt: state.org.grace_ends_at },
+    entitlements: finite(state.entitlements), usage: state.usage, recommendedPlan: nextPlan(state.org.plan_code),
+  };
+}
+
+// The visible trend window in months for run history, or null for no limit. Stored evidence is never deleted.
+export async function trendMonths(orgId) {
+  const org = await one(`select plan_code, entitlement_overrides from organizations where id = $1`, [orgId]);
+  const m = effectiveEntitlements(org?.plan_code || "legacy", activeOverrides(org)).trendMonths;
+  return Number.isFinite(m) ? m : null;
+}

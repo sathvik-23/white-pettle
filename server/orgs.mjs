@@ -137,10 +137,10 @@ export function keyStatus({ keys, allowPlatform }) {
 // ── usage and the monthly cap ─────────────────────────────────────────────────
 // Estimated list prices per call (USD), from docs/gcp-cost-plan.md. Real bills come from each provider; these
 // exist to show the trend and stop runaway spend, so they err high.
-export const COST = { ask: { chatgpt: 0.0145, perplexity: 0.0065, gemini: 0.004, groq: 0, aio: 0.003, aimode: 0.003, claude: 0.012 }, write: 0.002, inspect: 0.0005, site: 0.001, serp: 0.002, entity: 0 };
+export const COST = { ask: { chatgpt: 0.0145, perplexity: 0.0065, gemini: 0.004, groq: 0, aio: 0.003, aimode: 0.003, claude: 0.012 }, write: 0.002, draft: 0.002, inspect: 0.0005, site: 0.001, serp: 0.002, entity: 0 };
 // Writing is priced by the size of what was sent too (about $1 per million input tokens, ~4 characters a token),
 // so a huge prompt counts for what it costs rather than as one flat call.
-export const costOf = (kind, engine, bytes = 0) => { const c = COST[kind]; const base = typeof c === "number" ? c : c?.[engine] ?? 0.01; return kind === "write" ? base + (bytes / 4) * 1e-6 : base; };
+export const costOf = (kind, engine, bytes = 0) => { const c = COST[kind]; const base = typeof c === "number" ? c : c?.[engine] ?? 0.01; return kind === "write" || kind === "draft" ? base + (bytes / 4) * 1e-6 : base; };
 export async function meter({ orgId, workspaceId = null, userId = null, kind, engine = null, n = 1, bytes = 0 }) {
   if (!orgId || !n) return;
   await q(`insert into usage (org_id, workspace_id, user_id, kind, engine, n, cost_usd) values ($1, $2, $3, $4, $5, $6, $7)`,

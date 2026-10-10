@@ -65,3 +65,21 @@ test("stored payload keeps identifiers and statuses, never payment method detail
   const json = JSON.stringify(out);
   for (const bad of ["1111", "card", "a@b.c", "+91"]) assert.ok(!json.includes(bad), bad);
 });
+
+import { scheduledScope } from "../../server/routes.mjs";
+import { PLANS } from "../../server/plans.mjs";
+
+test("scheduled runs stay inside the plan: question cap, samples, weekly full run plus a daily rotation", () => {
+  const qs = Array.from({ length: 40 }, (_, i) => ({ text: "q" + i, on: i !== 3 }));
+  const ws = { schedule: "weekly", samples: 3, setup: { questions: qs }, rotation_cursor: 0 };
+  const weekly = scheduledScope(ws, PLANS.growth.entitlements);
+  assert.equal(weekly.ws.setup.questions.length, 30); assert.equal(weekly.samples, 1); assert.equal(weekly.partial, false);
+  const now = Date.parse("2026-10-10T00:00:00Z");
+  const rot = { ...ws, schedule: "rotating", last_full_run_at: "2026-10-08T00:00:00Z", rotation_cursor: 28 };
+  const r = scheduledScope(rot, PLANS.growth.entitlements, now);
+  assert.equal(r.partial, true); assert.equal(r.ws.setup.questions.length, 5);
+  assert.deepEqual(r.ws.setup.questions.map((x) => x.text), ["q29", "q30", "q0", "q1", "q2"]); assert.equal(r.cursor, 3);
+  assert.equal(scheduledScope({ ...rot, last_full_run_at: "2026-10-01T00:00:00Z" }, PLANS.growth.entitlements, now).partial, false);
+  assert.equal(scheduledScope({ ...rot, last_full_run_at: null }, PLANS.growth.entitlements, now).partial, false);
+  assert.equal(scheduledScope(ws, PLANS.legacy.entitlements).ws.setup.questions.length, 39);
+});

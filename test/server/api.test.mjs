@@ -251,9 +251,9 @@ test("billing: catalogue, checkout authorisation and idempotent webhooks", { ski
   assert.doesNotMatch(JSON.stringify(plans.data), /razorpay|plan_id|secret/i);
 
   // An owner with an editor, both fresh.
-  assert.equal((await call("pay", "POST", "/api/auth/signup", { email: "pay@x.co", password: "pay-pass-123" })).status, 200);
+  assert.equal((await call("pay", "POST", "/api/auth/signup", { email: "pay@x.co", password: "pay-pass-123" }, { "x-forwarded-for": "10.9.0.1" })).status, 200);
   const inv = await call("pay", "POST", "/api/org/invitations", { email: "ed@x.co", role: "editor" });
-  assert.equal((await call("ed", "POST", "/api/auth/signup", { email: "ed@x.co", password: "ed-pass-1234", invite: tokenFrom(inv.data.invite.link) })).status, 200);
+  assert.equal((await call("ed", "POST", "/api/auth/signup", { email: "ed@x.co", password: "ed-pass-1234", invite: tokenFrom(inv.data.invite.link) }, { "x-forwarded-for": "10.9.0.2" })).status, 200);
   const slug = (await call("pay", "GET", "/api/me")).data.org.slug;
   const [org] = await sql(`select id from organizations where slug = $1`, [slug]);
   let bill = (await call("pay", "GET", "/api/billing")).data;
@@ -334,4 +334,96 @@ test("billing: catalogue, checkout authorisation and idempotent webhooks", { ski
   assert.equal((await call("pay", "GET", "/api/billing")).data.mode, "read");
 
   for (const k of ["BILLING_ENABLED", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_PLAN_GROWTH_INR", "RAZORPAY_PLAN_STARTER_INR", "RAZORPAY_PLAN_AGENCY_INR"]) delete process.env[k];
+});
+
+// ── plan limits at every cost boundary ──
+test("billing: plan limits are enforced on the server", { skip: !DB && "set TEST_DATABASE_URL" }, async () => {
+  assert.equal((await call("st", "POST", "/api/auth/signup", { email: "st@x.co", password: "starter-pass1" }, { "x-forwarded-for": "10.9.0.3" })).status, 200);
+  const slug = (await call("st", "GET", "/api/me")).data.org.slug;
+  const [org] = await sql(`update organizations set plan_code = 'starter', billing_status = 'active', current_period_start = now(), current_period_end = now() + interval '30 days' where slug = $1 returning id`, [slug]);
+  const S = WS.setup, qs = (n) => Array.from({ length: n }, (_, i) => ({ text: "q" + i, on: true }));
+
+  // Brands, questions, competitors, engines.
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", site: "https://first.example", setup: S })).status, 200);
+  const second = await call("st", "PUT", "/api/workspaces/second", { name: "Second", site: "https://second.example", setup: S });
+  assert.equal(second.status, 402); assert.equal(second.data.code, "plan_limit"); assert.equal(second.data.capability, "brands");
+  assert.equal(second.data.recommendedPlan, "growth"); assert.match(second.data.error, /1 brand\b.*Upgrade to Growth/);
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, questions: qs(16) } })).data.capability, "questions");
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, questions: qs(15) } })).status, 200);
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, profile: { ...S.profile, competitors: ["a", "b", "c", "d"] } } })).data.capability, "competitors");
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: { ...S, engines: ["chatgpt", "aio"] } })).data.capability, "engines");
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { setup: { questions: qs(20) } })).data.capability, "questions");
+  assert.equal((await call("st", "PUT", "/api/workspaces/first", { name: "First", setup: S })).status, 200);
+
+  // Schedule, samples, seats, integrations.
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { schedule: "daily" })).data.capability, "schedule");
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { schedule: "rotating" })).data.capability, "schedule");
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { samples: 2 })).data.capability, "samples");
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { schedule: "weekly" })).status, 200);
+  assert.equal((await call("st", "POST", "/api/org/invitations", { email: "seat2@x.co", role: "viewer" })).data.capability, "seats");
+  assert.equal((await call("st", "PUT", "/api/workspaces/first/integrations/google", { property: "x" })).data.capability, "integrations");
+  assert.equal((await call("st", "GET", "/api/oauth/google/start?ws=first")).data.capability, "integrations");
+
+  // AI: engines outside the plan and action drafts past the monthly allowance are refused before any call.
+  const askAio = await call("st", "POST", "/api/ask", { engine: "aio", question: "x" }, { "x-wp-brand": "first" });
+  assert.equal(askAio.status, 402); assert.equal(askAio.data.capability, "engines");
+  await sql(`insert into usage (org_id, kind, n, cost_usd) values ($1, 'draft', 10, 0.02)`, [org.id]);
+  const pitch = await call("st", "POST", "/api/write", { kind: "pitch", data: {} });
+  assert.equal(pitch.data.capability, "actionDrafts"); assert.equal(pitch.data.used, 10); assert.equal(pitch.data.limit, 10);
+  const bill = (await call("st", "GET", "/api/billing")).data;
+  assert.equal(bill.usage.actionDrafts, 10); assert.equal(bill.usage.brands, 1); assert.equal(bill.entitlements.brands, 1);
+  assert.equal((await call("st", "GET", "/api/config")).data.billing.plan.code, "starter");
+
+  // Grace: people may still work, but the scheduler does not spend.
+  await sql(`update organizations set billing_status = 'past_due', grace_ends_at = now() + interval '2 days' where id = $1`, [org.id]);
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { runNow: true })).status, 200);
+  const before = (await sql(`select count(*)::int as n from runs r join workspaces w on w.id = r.workspace_id where w.org_id = $1`, [org.id]))[0].n;
+  assert.ok(!(await call("x", "POST", "/api/cron/tick", null, { "x-cron-secret": "tick-secret" })).data.ran.find((r) => r.slug === "first"));
+  assert.equal((await sql(`select count(*)::int as n from runs r join workspaces w on w.id = r.workspace_id where w.org_id = $1`, [org.id]))[0].n, before);
+  assert.ok((await sql(`select 1 from audit_log where org_id = $1 and action = 'check.skipped' and detail->>'reason' = 'billing_read_only'`, [org.id])).length);
+
+  // After grace: read-only. New AI work stops; reports stay readable.
+  await sql(`update organizations set grace_ends_at = now() - interval '1 minute' where id = $1`, [org.id]);
+  const ro = await call("st", "POST", "/api/ask", { engine: "chatgpt", question: "x" });
+  assert.equal(ro.status, 402); assert.equal(ro.data.code, "billing_read_only");
+  assert.equal((await call("st", "PATCH", "/api/workspaces/first", { runNow: true })).data.code, "billing_read_only");
+  assert.equal((await call("st", "GET", "/api/workspaces/first/runs")).status, 200);
+  assert.equal((await call("st", "GET", "/api/workspaces")).status, 200);
+
+  // Trend window: Starter shows six months; older evidence is kept but not shown.
+  await sql(`update organizations set billing_status = 'active' where id = $1`, [org.id]);
+  const [w] = await sql(`select id from workspaces where org_id = $1 and slug = 'first'`, [org.id]);
+  await sql(`insert into runs (id, workspace_id, status, started_at, summary) values ('old1', $1, 'done', now() - interval '8 months', '{}'), ('new1', $1, 'done', now() - interval '1 month', '{}')`, [w.id]);
+  const ids = (await call("st", "GET", "/api/workspaces/first/runs")).data.runs.map((r) => r.id);
+  assert.ok(ids.includes("new1") && !ids.includes("old1"));
+  assert.equal((await sql(`select count(*)::int as n from runs where id = 'old1'`))[0].n, 1);
+
+  // Legacy organisations are untouched by any of this (the earlier tests ran on legacy).
+  assert.equal((await sql(`select plan_code from organizations where slug = 'ai-xccelerate'`))[0].plan_code, "legacy");
+});
+
+test("billing: new self-serve organisations get a capped trial once billing is on", { skip: !DB && "set TEST_DATABASE_URL" }, async () => {
+  process.env.BILLING_ENABLED = "1";
+  try {
+    mails.length = 0;
+    assert.equal((await call("tr", "POST", "/api/auth/signup", { email: "tr@x.co", password: "trial-pass-1" }, { "x-forwarded-for": "10.9.0.4" })).status, 200);
+    const slug = (await call("tr", "GET", "/api/me")).data.org.slug;
+    let [o] = await sql(`select plan_code, billing_status, trial_ends_at from organizations where slug = $1`, [slug]);
+    assert.deepEqual(o, { plan_code: "trial", billing_status: "trialing", trial_ends_at: null });
+    // Nothing spends until the email is verified.
+    assert.equal((await call("tr", "POST", "/api/write", { kind: "pitch", data: {} })).data.code, "email_verification_required");
+    assert.equal((await call("tr", "PUT", "/api/workspaces/t1", { name: "T", setup: WS.setup })).data.code, "email_verification_required");
+    for (let i = 0; i < 50 && !mails.length; i++) await new Promise((r) => setTimeout(r, 20));
+    const token = mails.find((m) => m.to === "tr@x.co").text.match(/#verify=([\w-]+)/)[1];
+    assert.equal((await call("tr", "POST", "/api/auth/verify", { token })).status, 200);
+    [o] = await sql(`select trial_started_at, trial_ends_at from organizations where slug = $1`, [slug]);
+    const days = (new Date(o.trial_ends_at) - new Date(o.trial_started_at)) / 864e5;
+    assert.ok(Math.abs(days - 7) < 0.01, String(days));
+    assert.equal((await call("tr", "PUT", "/api/workspaces/t1", { name: "T", setup: WS.setup })).status, 200);
+    assert.equal((await call("tr", "PATCH", "/api/workspaces/t1", { schedule: "weekly" })).data.capability, "schedule");
+    // Two trial checks, then the trial is used up.
+    for (const id of ["tr1", "tr2"]) assert.equal((await call("tr", "PUT", "/api/runs/" + id, { slug: "t1", data: { startedAt: Date.now() } })).status, 200);
+    assert.equal((await call("tr", "PUT", "/api/runs/tr2", { slug: "t1", data: { startedAt: Date.now(), finishedAt: Date.now() } })).status, 200); // saving an existing run is fine
+    assert.equal((await call("tr", "PUT", "/api/runs/tr3", { slug: "t1", data: { startedAt: Date.now() } })).data.capability, "baselineRuns");
+  } finally { delete process.env.BILLING_ENABLED; }
 });
