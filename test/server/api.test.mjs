@@ -32,6 +32,9 @@ test("accounts, brands, runs, schedules and isolation", { skip: !DB && "set TEST
   assert.equal((await call("a", "POST", "/api/auth/signup", { email: "a@x.co", password: "longenough1" })).status, 200);
   assert.equal((await call("a", "POST", "/api/auth/signup", { email: "A@x.co", password: "longenough1" })).status, 409);
   assert.equal((await call("a", "GET", "/api/me")).data.user.email, "a@x.co");
+  // billing migration: existing and new organisations stay on unrestricted legacy access until deliberately moved
+  const [billingOrg] = await sql(`select plan_code, billing_status from organizations where slug = $1`, [(await call("a", "GET", "/api/me")).data.org.slug]);
+  assert.deepEqual(billingOrg, { plan_code: "legacy", billing_status: "internal" });
 
   assert.equal((await call("a", "PUT", "/api/workspaces/acme", { name: WS.name, site: WS.site, setup: WS.setup })).status, 200);
   const pat = await call("a", "PATCH", "/api/workspaces/acme", { schedule: "weekly", samples: 2, runNow: true });
