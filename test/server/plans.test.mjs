@@ -55,3 +55,31 @@ test("planned margins stay at or above 70%", () => {
 test("unknown plan codes resolve to the most restrictive (trial) entitlements", () => {
   assert.equal(effectiveEntitlements("made-up").questions, PLANS.trial.entitlements.questions);
 });
+
+import { accessMode, planError, nextPlan } from "../../server/billing.mjs";
+
+test("billing states preserve reports but stop spend after grace", () => {
+  const now = new Date("2026-10-10T12:00:00Z");
+  assert.equal(accessMode({ billing_status: "internal" }, now), "write");
+  assert.equal(accessMode({ billing_status: "active" }, now), "write");
+  assert.equal(accessMode({ billing_status: "trialing", trial_ends_at: "2026-10-11T00:00:00Z" }, now), "write");
+  assert.equal(accessMode({ billing_status: "trialing", trial_ends_at: "2026-10-09T00:00:00Z" }, now), "read");
+  assert.equal(accessMode({ billing_status: "trialing", trial_ends_at: null }, now), "read"); // not started: email not verified
+  assert.equal(accessMode({ billing_status: "past_due", grace_ends_at: "2026-10-11T00:00:00Z" }, now), "manual");
+  assert.equal(accessMode({ billing_status: "past_due", grace_ends_at: "2026-10-09T00:00:00Z" }, now), "read");
+  assert.equal(accessMode({ billing_status: "past_due", grace_ends_at: null }, now), "read");
+  assert.equal(accessMode({ billing_status: "canceled", current_period_end: "2026-10-11T00:00:00Z" }, now), "write");
+  assert.equal(accessMode({ billing_status: "canceled", current_period_end: "2026-10-09T00:00:00Z" }, now), "read");
+  assert.equal(accessMode({ billing_status: "paused" }, now), "read");
+  assert.equal(accessMode(null, now), "read");
+});
+
+test("plan errors are structured for upgrade UI", () => {
+  const e = planError("questions", 15, 15, "growth", "2026-11-01T00:00:00Z");
+  assert.equal(e.status, 402);
+  assert.deepEqual(e.extra, { code: "plan_limit", capability: "questions", used: 15, limit: 15, recommendedPlan: "growth", resetsAt: "2026-11-01T00:00:00Z" });
+});
+
+test("upgrade path recommends the next plan up", () => {
+  assert.deepEqual(["trial", "starter", "growth", "agency", "enterprise"].map(nextPlan), ["growth", "growth", "agency", "enterprise", "enterprise"]);
+});
