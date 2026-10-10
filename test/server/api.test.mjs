@@ -427,3 +427,50 @@ test("billing: new self-serve organisations get a capped trial once billing is o
     assert.equal((await call("tr", "PUT", "/api/runs/tr3", { slug: "t1", data: { startedAt: Date.now() } })).data.capability, "baselineRuns");
   } finally { delete process.env.BILLING_ENABLED; }
 });
+
+test("billing: full lifecycle against a fake Razorpay; only signed events change access", { skip: !DB && "set TEST_DATABASE_URL" }, async () => {
+  (await import("../../server/razorpay.mjs")).setClient(fakeRzp);
+  Object.assign(process.env, { BILLING_ENABLED: "1", RAZORPAY_KEY_ID: "rzp_test_key", RAZORPAY_KEY_SECRET: "rzp_secret_x", RAZORPAY_WEBHOOK_SECRET: WHSEC, RAZORPAY_PLAN_GROWTH_INR: "plan_growth_inr" });
+  try {
+    assert.equal((await call("lc", "POST", "/api/auth/signup", { email: "lc@x.co", password: "life-pass-123" }, { "x-forwarded-for": "10.9.0.5" })).status, 200);
+    const slug = (await call("lc", "GET", "/api/me")).data.org.slug;
+    const [org] = await sql(`select id from organizations where slug = $1`, [slug]);
+    fakeRzp.createSubscription = async () => ({ id: "sub_life_1", status: "created" });
+    assert.equal((await call("lc", "POST", "/api/billing/checkout", { plan: "growth", currency: "INR" })).status, 200);
+    const evt = (event, sub = {}, at = Date.now()) => { const e = subEvt(event, { id: "sub_life_1", ...sub }, at); return e; };
+    const plan = async () => (await call("lc", "GET", "/api/billing")).data.plan;
+
+    // The browser's checkout callback is not an API: polling shows "not yet" until Razorpay's webhook arrives.
+    assert.equal((await plan()).code, "trial"); // a new self-serve org, waiting for email verification
+    assert.equal((await hook(evt("subscription.authenticated", { status: "authenticated", customer_id: "cust_1" }), "lc_1")).status, 200);
+    assert.equal((await plan()).code, "trial"); // a mandate is not a payment
+    // A body re-serialised with different spacing fails the signature check.
+    const raw = JSON.stringify(evt("subscription.activated")), sig = crypto.createHmac("sha256", WHSEC).update(raw).digest("hex");
+    const bad = await fetch(base + "/api/webhooks/razorpay", { method: "POST", headers: { "x-razorpay-signature": sig, "x-razorpay-event-id": "lc_2" }, body: JSON.stringify(JSON.parse(raw), null, 1) });
+    assert.equal(bad.status, 400);
+    // The same activation delivered twice at once, without an event id header: recorded once (body hash).
+    const act = evt("subscription.activated");
+    const [r1, r2] = await Promise.all([hook(act), hook(act)]);
+    assert.deepEqual([r1.status, r2.status], [200, 200]);
+    assert.equal((await sql(`select count(*)::int as n from billing_events where event_id like 'sha256:%' and org_id = $1`, [org.id]))[0].n, 1);
+    let p = await plan(); assert.equal(p.code, "growth"); assert.equal(p.status, "active");
+    assert.equal((await sql(`select razorpay_customer_id from organizations where id = $1`, [org.id]))[0].razorpay_customer_id, "cust_1");
+    // Renewal fails, then succeeds inside grace.
+    assert.equal((await hook(evt("subscription.halted", { status: "halted" }), "lc_3")).status, 200);
+    assert.equal((await plan()).status, "past_due");
+    assert.equal((await hook(evt("subscription.charged", { current_end: unix(Date.now() + 60 * 864e5) }), "lc_4")).status, 200);
+    p = await plan(); assert.equal(p.status, "active");
+    // Completed after the period: read-only, history intact.
+    assert.equal((await hook(evt("subscription.completed", { status: "completed" }), "lc_5")).status, 200);
+    await sql(`update organizations set current_period_end = now() - interval '1 second' where id = $1`, [org.id]);
+    const b = (await call("lc", "GET", "/api/billing")).data;
+    assert.equal(b.plan.status, "canceled"); assert.equal(b.mode, "read");
+    assert.equal((await call("lc", "GET", "/api/workspaces")).status, 200);
+    // Every processed transition is in the audit log, with before and after.
+    const trail = await sql(`select action, detail from audit_log where org_id = $1 and action like 'billing.subscription.%' order by at`, [org.id]);
+    assert.deepEqual(trail.map((x) => x.action), ["billing.subscription.activated", "billing.subscription.halted", "billing.subscription.charged", "billing.subscription.completed"]);
+    assert.deepEqual(trail[0].detail.to, { plan: "growth", status: "active" });
+  } finally {
+    for (const k of ["BILLING_ENABLED", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_PLAN_GROWTH_INR"]) delete process.env[k];
+  }
+});
