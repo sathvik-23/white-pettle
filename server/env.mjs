@@ -8,7 +8,8 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 
 // Must match infra/terraform/secrets.tf `secret_names` exactly. Each lives in Secret Manager as WHITEPETAL_<NAME>.
 export const SECRET_NAMES = ["DATABASE_URL", "APP_SECRET", "CRON_SECRET", "OPENAI_API_KEY", "GEMINI_API_KEY", "PERPLEXITY_API_KEY", "GROQ_API_KEY", "ANTHROPIC_API_KEY",
-  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_API_KEY", "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "SERPAPI_KEY", "ACCESS_CODE", "RESEND_API_KEY"];
+  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_API_KEY", "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "SERPAPI_KEY", "ACCESS_CODE", "RESEND_API_KEY",
+  "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET"];
 
 // `vercel env pull` writes "[SENSITIVE]" for values it may not reveal. Treat that as unset, never as a key.
 const usable = (v) => v && v.trim() && !/^\[?SENSITIVE\]?$/i.test(v.trim());

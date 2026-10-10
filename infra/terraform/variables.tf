@@ -118,3 +118,23 @@ variable "email_from" {
   type        = string
   default     = "White Petal <no-reply@whitepetal.perfstaq.com>"
 }
+
+variable "billing_enabled" {
+  description = "Paid plans: \"0\" (checkout off, everyone keeps their access), \"operators\" (White Petal operators only) or \"1\" (owners/admins, and new sign-ups start a trial). Keep \"0\" until the Razorpay test-mode lifecycle has passed; see docs/razorpay-runbook.md."
+  type        = string
+  default     = "0"
+  validation {
+    condition     = contains(["0", "operators", "1"], var.billing_enabled)
+    error_message = "billing_enabled must be \"0\", \"operators\" or \"1\"."
+  }
+}
+
+variable "razorpay_plan_ids" {
+  description = "Razorpay monthly plan ids (not secret), keyed STARTER_USD, STARTER_INR, GROWTH_USD, GROWTH_INR, AGENCY_USD, AGENCY_INR. Passed to the app as RAZORPAY_PLAN_<KEY>; an empty or missing id keeps that plan unavailable."
+  type        = map(string)
+  default     = {}
+  validation {
+    condition     = alltrue([for k in keys(var.razorpay_plan_ids) : contains(["STARTER_USD", "STARTER_INR", "GROWTH_USD", "GROWTH_INR", "AGENCY_USD", "AGENCY_INR"], k)])
+    error_message = "razorpay_plan_ids keys must be STARTER_USD, STARTER_INR, GROWTH_USD, GROWTH_INR, AGENCY_USD or AGENCY_INR."
+  }
+}

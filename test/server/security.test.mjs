@@ -24,3 +24,26 @@ test("session ids are hashes, limiter trips, safeEqual is strict", () => {
   assert.equal(limited("k", 3), true);
   assert.equal(safeEqual("a", "a"), true); assert.equal(safeEqual("a", "b"), false); assert.equal(safeEqual("", ""), false);
 });
+
+test("billing secrets are loaded, provisioned and settable, each exactly once", async () => {
+  const fs = await import("node:fs");
+  const { SECRET_NAMES } = await import("../../server/env.mjs");
+  const tf = fs.readFileSync(new URL("../../infra/terraform/secrets.tf", import.meta.url), "utf8");
+  const tfNames = [...tf.match(/secret_names = toset\(\[([\s\S]*?)\]\)/)[1].matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]);
+  const sh = fs.readFileSync(new URL("../../infra/secrets.sh", import.meta.url), "utf8");
+  const manual = sh.match(/MANUAL_KEYS="([^"]*)"/)[1].split(/\s+/), tfKeys = sh.match(/TF_KEYS="([^"]*)"/)[1].split(/\s+/);
+  for (const key of ["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET"]) {
+    assert.equal(SECRET_NAMES.filter((x) => x === key).length, 1, key);
+    assert.equal(tfNames.filter((x) => x === key).length, 1, key);
+    assert.equal(manual.filter((x) => x === key).length, 1, key);
+  }
+  assert.deepEqual([...tfNames].sort(), [...SECRET_NAMES].sort(), "secrets.tf and env.mjs must list the same names");
+  assert.deepEqual([...manual, ...tfKeys].sort(), [...SECRET_NAMES].sort(), "secrets.sh must cover every name");
+});
+
+test("the example environment documents billing off by default, with no values", async () => {
+  const fs = await import("node:fs");
+  const ex = fs.readFileSync(new URL("../../.env.example", import.meta.url), "utf8");
+  assert.match(ex, /^BILLING_ENABLED=0$/m);
+  for (const k of ["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "RAZORPAY_PLAN_STARTER_USD", "RAZORPAY_PLAN_GROWTH_INR", "RAZORPAY_PLAN_AGENCY_INR"]) assert.match(ex, new RegExp(`^${k}=$`, "m"), k);
+});

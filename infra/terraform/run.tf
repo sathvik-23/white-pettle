@@ -184,6 +184,21 @@ resource "google_cloud_run_v2_service" "whitepetal" {
         value = var.email_from
       }
 
+      # Paid plans. Off unless billing_enabled says otherwise; the Razorpay
+      # keys themselves are secrets (secrets.tf), the plan ids are not.
+      env {
+        name  = "BILLING_ENABLED"
+        value = var.billing_enabled
+      }
+
+      dynamic "env" {
+        for_each = { for k, v in var.razorpay_plan_ids : k => v if v != "" }
+        content {
+          name  = "RAZORPAY_PLAN_${env.key}"
+          value = env.value
+        }
+      }
+
       # No PORT: Cloud Run reserves it, injects 8080, and rejects a service
       # that sets it.
 
